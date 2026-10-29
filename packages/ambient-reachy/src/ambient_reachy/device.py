@@ -73,7 +73,9 @@ class ReachyDevice:
         self._movement_manager: Any | None = None
         self._started = False
         self._daemon_lost = False
+        self._audio_fault: str | None = None
         self._mic_silent = False
+        self._play_generation = 0
         self._mic_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
         self._play_queue: asyncio.Queue[bytes] = asyncio.Queue()
         self._mic_task: asyncio.Task[None] | None = None
@@ -118,6 +120,7 @@ class ReachyDevice:
         if self._started:
             return
         self._daemon_lost = False
+        self._audio_fault = None
         self._mic_silent = False
         self._silence_seconds = 0.0
         self._silence_event_sent = False
@@ -222,49 +225,70 @@ class ReachyDevice:
                 pass
             self._mic_queue.put_nowait(None)
 
+    def _drain_play_queue(self) -> None:
+        while not self._play_queue.empty():
+            try:
+                self._play_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+    def _record_audio_fault(self, fault: str, event: str, exc: Exception) -> None:
+        self._audio_fault = fault
+        logger.exception("Reachy audio worker failed (%s)", fault)
+        try:
+            self.context.emit(event, "live", "error", exc_type=type(exc).__name__)
+        finally:
+            self._drain_play_queue()
+            self._end_mic_stream()
+
     async def _mic_worker(self) -> None:
-        import numpy as np
+        try:
+            import numpy as np
 
-        from ambient_reachy.audio import resample_linear, frame_to_mono_int16
+            from ambient_reachy.audio import resample_linear, frame_to_mono_int16
 
-        assert self._robot is not None
-        media = self._robot.media
-        source_rate = await asyncio.to_thread(media.get_input_audio_samplerate)
-        while True:
-            frame = await asyncio.to_thread(media.get_audio_sample)
-            if self._daemon_lost or not self._started:
-                return
-            if frame is None:
-                await asyncio.sleep(0.01)
-                continue
-            samples = frame_to_mono_int16(np.asarray(frame))
-            if source_rate != SAMPLE_RATE:
-                if not self._resample_logged:
-                    logger.info("Resampling Reachy microphone from %d Hz to %d Hz", source_rate, SAMPLE_RATE)
-                    self._resample_logged = True
-                samples = resample_linear(samples, int(source_rate), SAMPLE_RATE)
-            if not np.any(samples):
-                self._silence_seconds += samples.size / SAMPLE_RATE
-                if self._silence_seconds >= self.config.silence_alarm_s and not self._silence_event_sent:
-                    logger.error(
-                        "Microphone has delivered only zeros for %.0f s. Known Reachy Mini Lite XMOS startup fault "
-                        "(pollen-robotics/reachy_mini#770). Run `ambient-reachy-mic-check --reboot-xmos`, then "
-                        "restart ambient-home; if still silent, check the microphone FPC cable.",
-                        self.config.silence_alarm_s,
-                    )
-                    self.context.emit("mic.silent_stream", "live", "error", seconds=self._silence_seconds)
-                    self._mic_silent = True
-                    self._silence_event_sent = True
-            else:
-                self._silence_seconds = 0.0
-                self._mic_silent = False
-            pcm = samples.astype("<i2", copy=False).tobytes()
-            if self._mic_queue.full():
-                try:
-                    self._mic_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
-            self._mic_queue.put_nowait(pcm)
+            assert self._robot is not None
+            media = self._robot.media
+            source_rate = await asyncio.to_thread(media.get_input_audio_samplerate)
+            while True:
+                frame = await asyncio.to_thread(media.get_audio_sample)
+                if self._audio_fault is not None or self._daemon_lost or not self._started:
+                    return
+                if frame is None:
+                    await asyncio.sleep(0.01)
+                    continue
+                samples = frame_to_mono_int16(np.asarray(frame))
+                if source_rate != SAMPLE_RATE:
+                    if not self._resample_logged:
+                        logger.info("Resampling Reachy microphone from %d Hz to %d Hz", source_rate, SAMPLE_RATE)
+                        self._resample_logged = True
+                    samples = resample_linear(samples, int(source_rate), SAMPLE_RATE)
+                if not np.any(samples):
+                    self._silence_seconds += samples.size / SAMPLE_RATE
+                    if self._silence_seconds >= self.config.silence_alarm_s and not self._silence_event_sent:
+                        logger.error(
+                            "Microphone has delivered only zeros for %.0f s. Known Reachy Mini Lite XMOS startup fault "
+                            "(pollen-robotics/reachy_mini#770). Run `ambient-reachy-mic-check --reboot-xmos`, then "
+                            "restart ambient-home; if still silent, check the microphone FPC cable.",
+                            self.config.silence_alarm_s,
+                        )
+                        self.context.emit("mic.silent_stream", "live", "error", seconds=self._silence_seconds)
+                        self._mic_silent = True
+                        self._silence_event_sent = True
+                else:
+                    self._silence_seconds = 0.0
+                    self._mic_silent = False
+                pcm = samples.astype("<i2", copy=False).tobytes()
+                if self._mic_queue.full():
+                    try:
+                        self._mic_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
+                self._mic_queue.put_nowait(pcm)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._record_audio_fault("mic_failed", "mic.stream_failed", exc)
 
     async def mic(self) -> AsyncIterator[bytes]:
         """Yield PCM16 chunks until stopped or the daemon connection is lost."""
@@ -276,17 +300,29 @@ class ReachyDevice:
             yield chunk
 
     async def _play_worker(self) -> None:
-        import numpy as np
+        try:
+            import numpy as np
 
-        assert self._robot is not None
-        media = self._robot.media
-        while True:
-            pcm = await self._play_queue.get()
-            samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
-            await asyncio.to_thread(media.push_audio_sample, samples)
+            assert self._robot is not None
+            media = self._robot.media
+            while True:
+                pcm = await self._play_queue.get()
+                generation = self._play_generation
+                samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+                if self._play_generation != generation:
+                    continue
+                await asyncio.to_thread(media.push_audio_sample, samples)
+                if self._play_generation != generation:
+                    await self._clear_media_player(media)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._record_audio_fault("playback_failed", "speaker.playback_failed", exc)
 
     async def play(self, pcm16: bytes) -> None:
         """Queue a complete PCM16 chunk without waiting for playback."""
+        if self._audio_fault is not None:
+            raise RuntimeError(f"Reachy audio is faulted: {self._audio_fault}")
         if not self._started or self._daemon_lost:
             raise RuntimeError("Reachy device is not available")
         if not self.speaker_format.is_whole_frames(pcm16):
@@ -298,14 +334,13 @@ class ReachyDevice:
         await self._clear_playback()
 
     async def _clear_playback(self) -> None:
-        while not self._play_queue.empty():
-            try:
-                self._play_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
+        self._play_generation += 1
+        self._drain_play_queue()
         if self._robot is None:
             return
-        media = self._robot.media
+        await self._clear_media_player(self._robot.media)
+
+    async def _clear_media_player(self, media: Any) -> None:
         audio = getattr(media, "audio", media)
         clear = getattr(audio, "clear_player", None) or getattr(audio, "clear_output_buffer", None)
         if clear is not None:
@@ -423,6 +458,8 @@ class ReachyDevice:
             return DeviceHealth.down("not_started")
         if self._daemon_lost:
             return DeviceHealth.down("daemon_lost")
+        if self._audio_fault is not None:
+            return DeviceHealth.down(self._audio_fault)
         if self._mic_silent:
             return DeviceHealth.degraded("mic_silent")
         return DeviceHealth.ok()

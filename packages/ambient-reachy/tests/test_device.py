@@ -3,6 +3,7 @@
 import sys
 import asyncio
 import logging
+import threading
 import subprocess
 from typing import Any
 from pathlib import Path
@@ -82,6 +83,50 @@ class FakeMedia:
 
     def get_frame_jpeg(self) -> bytes:
         return b"fake-jpeg"
+
+
+class FailingMicMedia(FakeMedia):
+    def get_audio_sample(self) -> np.ndarray:
+        raise ConnectionError("private microphone detail")
+
+
+class FailingPlaybackMedia(FakeMedia):
+    def push_audio_sample(self, samples: np.ndarray) -> None:
+        del samples
+        raise RuntimeError("private playback detail")
+
+
+class DelayedMedia(FakeMedia):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.condition = threading.Condition()
+        self.buffer: list[np.ndarray] = []
+        self.push_count = 0
+
+    def push_audio_sample(self, samples: np.ndarray) -> None:
+        self.entered.set()
+        if not self.release.wait(timeout=5):
+            raise TimeoutError("test did not release delayed audio")
+        with self.condition:
+            self.buffer.append(samples.copy())
+            self.push_count += 1
+            self.condition.notify_all()
+
+    def clear_player(self) -> None:
+        with self.condition:
+            self.buffer.clear()
+            self.clears += 1
+            self.condition.notify_all()
+
+    def wait_for_push_count(self, count: int, timeout: float) -> bool:
+        with self.condition:
+            return self.condition.wait_for(lambda: self.push_count >= count, timeout)
+
+    def wait_for_clear_count(self, count: int, timeout: float) -> bool:
+        with self.condition:
+            return self.condition.wait_for(lambda: self.clears >= count, timeout)
 
 
 class FakeRobot:
@@ -355,6 +400,127 @@ async def test_playback_is_nonblocking_ordered_and_validates_frames(monkeypatch:
     await device.stop_playback()
     assert robot.media.clears == 1
     assert device._play_queue.empty()
+    await device.stop()
+
+
+async def test_audio_worker_failures_end_mic_report_health_and_reset_on_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_daemon(monkeypatch)
+    events: list[tuple[str, str, str, dict[str, object]]] = []
+
+    def emit(name: str, component: str, level: str = "info", **data: object) -> None:
+        events.append((name, component, level, data))
+
+    device = ReachyDevice(
+        DeviceContext(
+            "reachy-test",
+            {"mic_autorecover": False, "camera": False, "body_tools": []},
+            emit=emit,
+        ),
+        hardware=FakeHardware([FakeRobot(FailingMicMedia(), []), _robot()]),
+    )
+    await device.start()
+
+    with pytest.raises(StopAsyncIteration):
+        await asyncio.wait_for(anext(device.mic()), timeout=0.5)
+    health = await device.health()
+    assert health.status is HealthStatus.DOWN
+    assert health.reason == "mic_failed"
+    assert events == [("mic.stream_failed", "live", "error", {"exc_type": "ConnectionError"})]
+    assert "private microphone detail" not in repr(events)
+
+    await device.stop()
+    await device.start()
+    assert device._audio_fault is None
+    assert (await device.health()).status is HealthStatus.OK
+    await device.stop()
+
+
+async def test_playback_worker_failure_ends_mic_rejects_play_and_resets_on_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_daemon(monkeypatch)
+    events: list[tuple[str, str, str, dict[str, object]]] = []
+
+    def emit(name: str, component: str, level: str = "info", **data: object) -> None:
+        events.append((name, component, level, data))
+
+    device = ReachyDevice(
+        DeviceContext(
+            "reachy-test",
+            {"mic_autorecover": False, "camera": False, "body_tools": []},
+            emit=emit,
+        ),
+        hardware=FakeHardware([FakeRobot(FailingPlaybackMedia(), []), _robot()]),
+    )
+    await device.start()
+    await device.play(np.array([1024], dtype="<i2").tobytes())
+
+    with pytest.raises(StopAsyncIteration):
+        await asyncio.wait_for(anext(device.mic()), timeout=0.5)
+    health = await device.health()
+    assert health.status is HealthStatus.DOWN
+    assert health.reason == "playback_failed"
+    assert events == [("speaker.playback_failed", "live", "error", {"exc_type": "RuntimeError"})]
+    assert "private playback detail" not in repr(events)
+    assert device._play_queue.empty()
+    with pytest.raises(RuntimeError, match="playback_failed"):
+        await device.play(b"\0\0")
+
+    await device.stop()
+    await device.start()
+    assert device._audio_fault is None
+    assert (await device.health()).status is HealthStatus.OK
+    await device.stop()
+
+
+async def test_normal_stop_does_not_record_an_audio_fault(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_daemon(monkeypatch)
+    events: list[str] = []
+    device = _device(_robot(), emit=lambda name, *args, **kwargs: events.append(name))
+    await device.start()
+    await device.stop()
+
+    assert device._audio_fault is None
+    assert events == []
+
+
+async def test_stop_playback_clears_inflight_audio_before_new_audio(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_daemon(monkeypatch)
+    media = DelayedMedia()
+    device = _device(FakeRobot(media, []))
+    audio_a = np.array([8192, -8192], dtype="<i2")
+    audio_b = np.array([4096, -4096], dtype="<i2")
+    await device.start()
+
+    await device.play(audio_a.tobytes())
+    assert await asyncio.to_thread(media.entered.wait, 1.0)
+    await asyncio.wait_for(device.stop_playback(), timeout=0.5)
+    await device.play(audio_b.tobytes())
+    media.release.set()
+
+    assert await asyncio.to_thread(media.wait_for_push_count, 2, 1.0)
+    assert len(media.buffer) == 1
+    np.testing.assert_array_equal(media.buffer[0], audio_b.astype(np.float32) / 32768.0)
+    assert media.clears >= 2
+    await device.stop()
+
+
+async def test_stop_playback_drops_late_inflight_audio_without_new_audio(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_daemon(monkeypatch)
+    media = DelayedMedia()
+    device = _device(FakeRobot(media, []))
+    await device.start()
+
+    await device.play(np.array([8192, -8192], dtype="<i2").tobytes())
+    assert await asyncio.to_thread(media.entered.wait, 1.0)
+    await asyncio.wait_for(device.stop_playback(), timeout=0.5)
+    media.release.set()
+
+    assert await asyncio.to_thread(media.wait_for_push_count, 1, 1.0)
+    assert await asyncio.to_thread(media.wait_for_clear_count, 2, 1.0)
+    assert media.buffer == []
     await device.stop()
 
 
