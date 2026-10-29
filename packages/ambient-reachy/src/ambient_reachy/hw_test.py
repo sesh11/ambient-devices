@@ -1,4 +1,4 @@
-"""Two-minute hardware check for the Reachy Mini Lite: ``uv run ambient-hw-test``."""
+"""Two-minute hardware check for the Reachy Mini Lite: ``ambient-reachy-hw-test``."""
 
 import os
 import sys
@@ -502,7 +502,7 @@ def format_markdown(results: Sequence[CheckResult], *, total_s: float, app_resto
     """Render a scrubbed Markdown summary suitable for a PR description."""
     passed = all(result.ok for result in results)
     lines = [
-        f"### `ambient-hw-test`: {'PASS' if passed else 'FAIL'} ({total_s:.0f} s)",
+        f"### `ambient-reachy-hw-test`: {'PASS' if passed else 'FAIL'} ({total_s:.0f} s)",
         "",
         "| Check | Result | Detail |",
         "| --- | --- | --- |",

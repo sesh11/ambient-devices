@@ -130,7 +130,7 @@ def test_format_markdown_reports_failure_and_restart() -> None:
         app_restored=True,
     )
 
-    assert "FAIL (42 s)" in text
+    assert "### `ambient-reachy-hw-test`: FAIL (42 s)" in text
     assert "| head | FAIL | a\\|b |" in text
     assert "restarted afterwards: yes" in text
 
