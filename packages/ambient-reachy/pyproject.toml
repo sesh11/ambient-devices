@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ambient-reachy"
+version = "0.1.0"
+description = "Reachy Mini Lite device connector for ambient-home"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "ambient-device-sdk @ git+https://github.com/sesh11/ambient-home.git@a26fb92de1060f7e7b0e3211f596fab8a5718fad#subdirectory=packages/ambient-device-sdk",
+    "reachy-mini-conversation-app @ git+https://github.com/pollen-robotics/reachy_mini_conversation_app.git@f885bf421764ff7ff18dff26ae77b24b99a3af8c",
+    "numpy",
+    "httpx",
+    "python-dotenv",
+]
+
+[project.entry-points."ambient_device_sdk.devices"]
+reachy-mini-lite = "ambient_reachy.plugin:PLUGIN"
+
+[project.scripts]
+ambient-reachy-hw-test = "ambient_reachy.hw_test:main"
+ambient-reachy-mic-check = "ambient_reachy.mic_check:main"
+ambient-reachy-install-daemon = "ambient_reachy.daemon_service:install_main"
+ambient-reachy-uninstall-daemon = "ambient_reachy.daemon_service:uninstall_main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+ambient_reachy = ["py.typed", "launchd/*.plist", "scripts/*.sh"]

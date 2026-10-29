@@ -4,6 +4,7 @@ import os
 import sys
 import json
 import time
+import shlex
 import shutil
 import asyncio
 import argparse
@@ -12,17 +13,17 @@ import subprocess
 from types import TracebackType
 from pathlib import Path
 from datetime import datetime, timezone
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, replace, dataclass
 from collections.abc import Callable, Sequence
 
 import httpx
 import numpy as np
-from dotenv import load_dotenv
 
-from ambient_home.config import AmbientSettings, settings_from_env
-from ambient_home.daemon import READY_STATE, fetch_daemon_state
-from ambient_home.service import APP_LABEL, domain, launchctl
-from ambient_home.telemetry import EventLog, scrub_text
+from ambient_reachy._scrub import scrub_text
+from ambient_reachy.daemon import READY_STATE, fetch_daemon_state
+from ambient_reachy._events import EventLog
+from ambient_reachy.settings import KitSettings
+from ambient_reachy.daemon_service import APP_LABEL, domain, launchctl
 
 
 PASS = "pass"
@@ -53,6 +54,10 @@ class CheckFailed(Exception):
     """Raised by a check to fail with a readable detail."""
 
 
+class CheckSkipped(Exception):
+    """Raised by a check that cannot run in this environment."""
+
+
 CheckFn = Callable[[], str]
 
 
@@ -78,6 +83,8 @@ def run_checks(checks: Sequence[Check], clock: Callable[[], float] = time.monoto
             try:
                 detail = check.run()
                 status = PASS
+            except CheckSkipped as exc:
+                detail, status = str(exc), SKIP
             except CheckFailed as exc:
                 detail, status = str(exc), FAIL
             except Exception as exc:
@@ -171,7 +178,7 @@ def settled_pose(
     return previous
 
 
-def check_daemon(settings: AmbientSettings) -> str:
+def check_daemon(settings: KitSettings) -> str:
     """Pass when the Reachy daemon reports it is running."""
 
     async def fetch() -> str | None:
@@ -186,7 +193,7 @@ def check_daemon(settings: AmbientSettings) -> str:
 
 def check_audio_device() -> str:
     """Pass when the Reachy audio board answers with its firmware version."""
-    from ambient_home.mic_check import read_firmware_version
+    from ambient_reachy.mic_check import read_firmware_version
 
     version = read_firmware_version()
     if not version[:1].isdigit():
@@ -196,7 +203,7 @@ def check_audio_device() -> str:
 
 def check_microphone(seconds: float) -> str:
     """Pass when a short recording has real sound, rebooting the XMOS chip once if it is all zeros like the app does."""
-    from ambient_home.mic_check import probe_microphone, restart_audio_processor
+    from ambient_reachy.mic_check import probe_microphone, restart_audio_processor
 
     probe = probe_microphone(seconds)
     detail = f"verdict={probe.verdict} frames={probe.frames} peak={probe.peak:.4f}"
@@ -210,63 +217,28 @@ def check_microphone(seconds: float) -> str:
     return detail
 
 
-def check_wake_word(settings: AmbientSettings, timeout_s: float, speak: bool) -> str:
-    """Say the wake word through the Mac speaker and wait for the local detector to fire."""
-    from reachy_mini.media.audio_gstreamer import GStreamerAudio
+def check_speech_heard(seconds: float, wake_word: str, speak: bool) -> str:
+    """Pass when a short device-only recording contains non-silent sound."""
+    from ambient_reachy.mic_check import probe_microphone
 
-    from ambient_home.audio import frame_to_mono_int16
-    from ambient_home.wake_word import OpenWakeWordDetector
-
-    detector = OpenWakeWordDetector(settings.wake_word, settings.wake_threshold)
-    try:
-        detector.feed(np.zeros(1280, dtype=np.int16))
-    except Exception as exc:
-        raise CheckFailed(
-            f"wake model {settings.wake_word} did not load ({type(exc).__name__}); "
-            "a fresh venv may need openwakeword.utils.download_models()"
-        ) from exc
-    detector.reset()
-    phrase = wake_phrase(settings.wake_word)
-    audio = GStreamerAudio()
-    audio.start_recording()
+    phrase = wake_phrase(wake_word)
     speaker: subprocess.Popen[bytes] | None = None
+    if speak:
+        say = shutil.which("say")
+        if say is None:
+            raise CheckFailed("macOS `say` not found; rerun with --no-speak and say the phrase yourself")
+        speaker = subprocess.Popen([say, phrase], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        print(f"say '{phrase}' now")
     try:
-        settle_until = time.monotonic() + 0.5
-        while time.monotonic() < settle_until:
-            audio.get_audio_sample()
-            time.sleep(0.01)
-        say = shutil.which("say") if speak else None
-        if speak and say is None:
-            raise CheckFailed("macOS `say` not found; rerun with --no-speak and say the wake word yourself")
-        if say is not None:
-            speaker = subprocess.Popen([say, phrase])
-        else:
-            print(f"say '{phrase}' now (waiting {timeout_s:.0f} s)")
-        deadline = time.monotonic() + timeout_s
-        best = 0.0
-        spoken = 1
-        finished_at: float | None = None
-        while time.monotonic() < deadline:
-            if speaker is not None and say is not None and speaker.poll() is not None:
-                finished_at = finished_at or time.monotonic()
-                if spoken < _WAKE_ATTEMPTS and time.monotonic() - finished_at > 1.5:
-                    speaker = subprocess.Popen([say, phrase])
-                    spoken += 1
-                    finished_at = None
-            frame = audio.get_audio_sample()
-            if frame is None:
-                time.sleep(0.01)
-                continue
-            if detector.feed(frame_to_mono_int16(frame)):
-                return f"'{phrase}' detected on try {spoken}, score={detector.last_score:.2f}"
-            best = max(best, detector.take_peak_score())
-        raise CheckFailed(
-            f"'{phrase}' not detected in {timeout_s:.0f} s, said {spoken}x (best score {best:.2f}, threshold {settings.wake_threshold})"
-        )
+        probe = probe_microphone(seconds)
     finally:
-        audio.stop_recording()
         if speaker is not None and speaker.poll() is None:
             speaker.terminate()
+    detail = f"verdict={probe.verdict} frames={probe.frames} peak={probe.peak:.4f}"
+    if probe.verdict != "ok":
+        raise CheckFailed(f"{detail}; speak near the microphone and check its cable")
+    return detail
 
 
 def check_head() -> str:
@@ -303,62 +275,75 @@ def check_telemetry(event_log: EventLog, run_id: str) -> str:
     return f"event written and read back in {event_log.directory}"
 
 
-def _app_command() -> list[str]:
-    return [sys.executable, "-c", "from ambient_home.main import main; main()"]
-
-
-def check_live(
-    settings: AmbientSettings,
+def _check_hub_wake(
+    settings: KitSettings,
     event_log: EventLog,
     timeout_s: float,
     speak: bool,
-    popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
+    popen: Callable[..., subprocess.Popen[bytes]],
 ) -> str:
-    """Run the real app briefly, wake it, and wait for a paid Live session to open."""
+    """Run the configured hub, speak the wake phrase, and require its wake event."""
+    if not settings.hub_command:
+        raise CheckSkipped("needs --hub-command (wake word runs in ambient-home)")
     started_at = datetime.now(timezone.utc)
     env = {
         **os.environ,
         "AMBIENT_EVENTS_DIR": str(event_log.directory),
-        "AMBIENT_IDLE_TIMEOUT_S": "8",
-        "AMBIENT_MAX_SESSION_S": "20",
-        "AMBIENT_HEARTBEAT_S": "30",
+        "OPENAI_API_KEY": "",
     }
-    process = popen(_app_command(), env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    process = popen(shlex.split(settings.hub_command), env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     phrase = wake_phrase(settings.wake_word)
-
-    def seen(event_type: str) -> bool:
-        return any(event.type == event_type for event in event_log.read(started_at))
-
+    speaker: subprocess.Popen[bytes] | None = None
     try:
         deadline = time.monotonic() + timeout_s
-        while not seen("app.started"):
+        app_started = None
+        while app_started is None:
+            app_started = next((event for event in event_log.read(started_at) if event.type == "app.started"), None)
             if process.poll() is not None:
-                raise CheckFailed(f"app exited early with code {process.returncode}")
+                raise CheckFailed(f"hub exited early with code {process.returncode}")
             if time.monotonic() > deadline:
-                raise CheckFailed("app did not start in time")
-            time.sleep(0.5)
-        time.sleep(3.0)
-        if speak and shutil.which("say"):
-            subprocess.run(["say", phrase], check=False)
+                raise CheckFailed("hub did not emit app.started in time")
+            if app_started is None:
+                time.sleep(0.25)
+        say = shutil.which("say") if speak else None
+        if speak and say is None:
+            raise CheckFailed("macOS `say` not found; rerun with --no-speak and say the wake word yourself")
+        spoken = 0
+        if say is not None:
+            speaker = popen([say, phrase], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            spoken = 1
         else:
-            print(f"say '{phrase}' now")
-        while not seen("live.session_started"):
+            print(f"say '{phrase}' now (waiting {timeout_s:.0f} s)")
+        last_speech_finished: float | None = None
+        while time.monotonic() <= deadline:
+            events = event_log.read(app_started.ts)
+            if any(event.type == "wake.detected" and event.ts > app_started.ts for event in events):
+                detail = f"wake detected by hub after app.started; phrase='{phrase}'"
+                break
             if process.poll() is not None:
-                raise CheckFailed(f"app exited with code {process.returncode} before a Live session opened")
-            if time.monotonic() > deadline:
-                raise CheckFailed("no Live session opened before the timeout")
-            time.sleep(0.5)
-        detail = "Live session opened"
+                raise CheckFailed(f"hub exited with code {process.returncode} before wake.detected")
+            if speaker is not None and say is not None and speaker.poll() is not None:
+                last_speech_finished = last_speech_finished or time.monotonic()
+                if spoken < _WAKE_ATTEMPTS and time.monotonic() - last_speech_finished > 1.5:
+                    speaker = popen([say, phrase], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    spoken += 1
+                    last_speech_finished = None
+            time.sleep(0.25)
+        else:
+            raise CheckFailed(f"hub did not emit wake.detected within {timeout_s:.0f} s")
     finally:
+        if speaker is not None and speaker.poll() is None:
+            speaker.terminate()
         if process.poll() is None:
             process.terminate()
             try:
                 process.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 process.kill()
+    assert app_started is not None
     dispatched = [
         event
-        for event in event_log.read(started_at)
+        for event in event_log.read(app_started.ts)
         if event.type == "tool.completed" and event.data.get("tool") == "dispatch_job"
     ]
     if dispatched:
@@ -366,8 +351,32 @@ def check_live(
     return detail
 
 
+def check_wake_word(
+    settings: KitSettings,
+    event_log: EventLog,
+    timeout_s: float,
+    speak: bool,
+    popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
+) -> str:
+    """Exercise the hub's own wake-word detector when a hub command is configured."""
+    return _check_hub_wake(settings, event_log, timeout_s, speak, popen)
+
+
+def check_live(
+    settings: KitSettings,
+    event_log: EventLog,
+    timeout_s: float,
+    speak: bool,
+    popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
+) -> str:
+    """Validate hub startup and wake detection without invoking paid Live APIs."""
+    if not settings.hub_command:
+        raise CheckFailed("--live requires AMBIENT_HUB_COMMAND")
+    return _check_hub_wake(settings, event_log, timeout_s, speak, popen)
+
+
 def build_checks(
-    settings: AmbientSettings,
+    settings: KitSettings,
     event_log: EventLog,
     run_id: str,
     *,
@@ -383,7 +392,16 @@ def build_checks(
         Check("daemon", lambda: check_daemon(settings)),
         Check("audio device", check_audio_device),
         Check("microphone", lambda: check_microphone(mic_seconds), needs=("audio device",)),
-        Check("wake word", lambda: check_wake_word(settings, wake_timeout_s, speak), needs=("microphone",)),
+        Check(
+            "speech heard",
+            lambda: check_speech_heard(mic_seconds, settings.wake_word, speak),
+            needs=("microphone",),
+        ),
+        Check(
+            "wake word",
+            lambda: check_wake_word(settings, event_log, wake_timeout_s, speak),
+            needs=("daemon", "microphone"),
+        ),
         Check("head", check_head, needs=("daemon",)),
     ]
     if live:
@@ -426,19 +444,24 @@ def format_markdown(results: Sequence[CheckResult], *, total_s: float, app_resto
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the hardware checks and print a pass/fail table."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--live", action="store_true", help="also open one paid OpenAI Live session")
+    parser.add_argument("--live", action="store_true", help="also validate hub startup and wake detection")
     parser.add_argument("--no-pause", action="store_true", help="don't stop the always-on app LaunchAgent")
     parser.add_argument("--no-speak", action="store_true", help="don't use `say`; you speak the wake word")
     parser.add_argument("--mic-seconds", type=float, default=2.0)
     parser.add_argument("--wake-timeout", type=float, default=15.0)
     parser.add_argument("--live-timeout", type=float, default=60.0)
+    parser.add_argument("--hub-command", default=None, help="command to start ambient-home for wake checks")
     parser.add_argument("--markdown", type=Path, default=None, help="write a scrubbed Markdown summary here")
     parser.add_argument("--json", type=Path, default=None, help="write machine-readable results here")
     args = parser.parse_args(argv)
 
-    load_dotenv()
-    settings = settings_from_env()
-    event_log = EventLog(settings.events_dir, retention_days=settings.event_retention_days)
+    settings = KitSettings.from_env()
+    if args.hub_command:
+        settings = replace(settings, hub_command=args.hub_command)
+    if args.live and not settings.hub_command:
+        print("error: --live requires AMBIENT_HUB_COMMAND", file=sys.stderr)
+        return 2
+    event_log = EventLog(settings.events_dir)
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     started = time.monotonic()
     checks = build_checks(

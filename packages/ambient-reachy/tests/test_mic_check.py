@@ -3,8 +3,8 @@
 import numpy as np
 import pytest
 
-from ambient_home import mic_check
-from ambient_home.mic_check import MicProbe, verdict, measure_frames
+from ambient_reachy import mic_check
+from ambient_reachy.mic_check import MicProbe, verdict, measure_frames
 
 
 def test_measure_frames_downmixes_stereo() -> None:
@@ -38,10 +38,14 @@ def _probe(frames: int, peak: float) -> MicProbe:
 def test_ensure_microphone_audio_skips_reboot_when_ok(monkeypatch: pytest.MonkeyPatch) -> None:
     events: list[tuple[str, dict[str, object]]] = []
     monkeypatch.setattr(mic_check, "probe_microphone", lambda seconds: _probe(100, 0.2))
-    monkeypatch.setattr(mic_check, "restart_audio_processor", lambda: pytest.fail("must not reboot"))
-    monkeypatch.setattr(mic_check, "emit", lambda name, component, level="info", **data: events.append((name, data)))
+    monkeypatch.setattr(mic_check, "restart_audio_processor", lambda **kwargs: pytest.fail("must not reboot"))
 
-    assert mic_check.ensure_microphone_audio() == "ok"
+    assert (
+        mic_check.ensure_microphone_audio(
+            emit=lambda name, component, level="info", **data: events.append((name, data))
+        )
+        == "ok"
+    )
     assert events == [("mic.check", {"verdict": "ok", "frames": 100, "peak": 0.2, "stage": "initial"})]
 
 
@@ -50,10 +54,14 @@ def test_ensure_microphone_audio_reboots_once_when_silent(monkeypatch: pytest.Mo
     probes = iter([_probe(100, 0.0), _probe(100, 0.2)])
     restarts: list[bool] = []
     monkeypatch.setattr(mic_check, "probe_microphone", lambda seconds: next(probes))
-    monkeypatch.setattr(mic_check, "restart_audio_processor", lambda: restarts.append(True) or True)
-    monkeypatch.setattr(mic_check, "emit", lambda name, component, level="info", **data: events.append((name, data)))
+    monkeypatch.setattr(mic_check, "restart_audio_processor", lambda **kwargs: restarts.append(True) or True)
 
-    assert mic_check.ensure_microphone_audio() == "ok"
+    assert (
+        mic_check.ensure_microphone_audio(
+            emit=lambda name, component, level="info", **data: events.append((name, data))
+        )
+        == "ok"
+    )
     assert restarts == [True]
     assert [event[0] for event in events] == ["mic.check", "mic.check"]
     assert [event[1]["stage"] for event in events] == ["initial", "after_restart"]
@@ -61,14 +69,14 @@ def test_ensure_microphone_audio_reboots_once_when_silent(monkeypatch: pytest.Mo
 
 def test_ensure_microphone_audio_reports_persistent_silence(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(mic_check, "probe_microphone", lambda seconds: _probe(100, 0.0))
-    monkeypatch.setattr(mic_check, "restart_audio_processor", lambda: True)
+    monkeypatch.setattr(mic_check, "restart_audio_processor", lambda **kwargs: True)
 
     assert mic_check.ensure_microphone_audio() == "silent"
 
 
 def test_ensure_microphone_audio_no_frames_does_not_reboot(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(mic_check, "probe_microphone", lambda seconds: _probe(0, 0.0))
-    monkeypatch.setattr(mic_check, "restart_audio_processor", lambda: pytest.fail("must not reboot"))
+    monkeypatch.setattr(mic_check, "restart_audio_processor", lambda **kwargs: pytest.fail("must not reboot"))
 
     assert mic_check.ensure_microphone_audio() == "silent"
 

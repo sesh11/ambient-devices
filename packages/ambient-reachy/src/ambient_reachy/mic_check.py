@@ -8,8 +8,7 @@ from collections.abc import Sequence
 
 import numpy as np
 from numpy.typing import NDArray
-
-from ambient_home.telemetry import emit
+from ambient_device_sdk import EventSink, null_event_sink
 
 
 logger = logging.getLogger(__name__)
@@ -85,7 +84,10 @@ def read_firmware_version() -> str:
         device.close()
 
 
-def restart_audio_processor(settle_s: float = XMOS_RESTART_SETTLE_S) -> bool:
+def restart_audio_processor(
+    settle_s: float = XMOS_RESTART_SETTLE_S,
+    emit: EventSink = null_event_sink,
+) -> bool:
     """Reboot the XMOS audio processor and wait for it to come back."""
     from reachy_mini.media.audio_control_utils import ReSpeaker, init_respeaker_usb
 
@@ -135,7 +137,7 @@ def probe_microphone(seconds: float) -> MicProbe:
     )
 
 
-def ensure_microphone_audio(seconds: float = 1.5) -> str:
+def ensure_microphone_audio(seconds: float = 1.5, emit: EventSink = null_event_sink) -> str:
     """Probe the microphone and restart the audio processor when it is silent.
 
     Reachy Mini Lite streams all-zero microphone audio after some USB
@@ -159,7 +161,7 @@ def ensure_microphone_audio(seconds: float = 1.5) -> str:
         emit("mic.device_missing", "mic_check", "error")
         return probe.verdict
     logger.warning("Microphone returned only zeros (%d frames); restarting the audio processor.", probe.frames)
-    if not restart_audio_processor():
+    if not restart_audio_processor(emit=emit):
         return probe.verdict
     recheck = probe_microphone(seconds)
     emit(
@@ -199,5 +201,5 @@ def main() -> int:
         f"rms={probe.rms:.6f} peak={probe.peak:.6f} verdict={probe.verdict}"
     )
     if probe.verdict != "ok" and not args.reboot_xmos:
-        print("Try: `uv run ambient-mic-check --reboot-xmos`")
+        print("Try: `ambient-reachy-mic-check --reboot-xmos`")
     return 0 if probe.verdict == "ok" else 1

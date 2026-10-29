@@ -1,15 +1,12 @@
 """Reachy Mini daemon readiness and liveness checks."""
 
-import os
 import time
 import asyncio
 import logging
-from typing import NoReturn
 from collections.abc import Callable, Awaitable
 
 import httpx
-
-from ambient_home.telemetry import emit
+from ambient_device_sdk import EventSink, null_event_sink
 
 
 logger = logging.getLogger(__name__)
@@ -40,6 +37,7 @@ async def wait_for_daemon(
     timeout_s: float,
     poll_s: float = 1.0,
     client: httpx.AsyncClient | None = None,
+    emit: EventSink = null_event_sink,
 ) -> bool:
     """Poll the daemon status endpoint until it reports running or the timeout elapses."""
     deadline = time.monotonic() + timeout_s
@@ -80,6 +78,7 @@ async def watch_daemon(
     max_failures: int,
     on_lost: Callable[[str], Awaitable[None]],
     client: httpx.AsyncClient | None = None,
+    emit: EventSink = null_event_sink,
 ) -> None:
     """Poll the daemon while running and call ``on_lost`` after consecutive failures."""
     owned = client is None
@@ -115,11 +114,3 @@ async def watch_daemon(
     finally:
         if owned:
             await http.aclose()
-
-
-def exit_process(code: int, reason: str) -> NoReturn:
-    """Terminate the process immediately so the service supervisor restarts it."""
-    logger.error("Exiting with status %d: %s", code, reason)
-    emit("process.exit", "daemon", "error", code=code, reason=reason)
-    logging.shutdown()
-    os._exit(code)

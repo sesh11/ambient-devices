@@ -7,16 +7,18 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/sh</string>
-        <string>$repo_dir/scripts/run-daemon.sh</string>
+        <string>$script_path</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>$repo_dir</string>
+    <string>$home</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
         <string>$path</string>
         <key>HOME</key>
         <string>$home</string>
+        <key>REACHY_DAEMON_BIN</key>
+        <string>$daemon_bin</string>
         <key>UV_BIN</key>
         <string>$uv_bin</string>
     </dict>

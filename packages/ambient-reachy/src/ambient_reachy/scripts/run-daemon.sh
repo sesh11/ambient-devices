@@ -5,6 +5,7 @@
 set -eu
 
 UV_BIN="${UV_BIN:-uv}"
+REACHY_DAEMON_BIN="${REACHY_DAEMON_BIN:-}"
 PORT_GLOB="${AMBIENT_SERIAL_PORT_GLOB:-/dev/cu.usbmodem*}"
 POLL_S="${AMBIENT_SERIAL_POLL_S:-2}"
 
@@ -25,7 +26,11 @@ if [ -z "$port" ] || [ ! -e "$port" ]; then
 fi
 
 echo "run-daemon: starting reachy-mini-daemon on $port"
-"$UV_BIN" run reachy-mini-daemon --serialport "$port" "$@" &
+if [ -n "$REACHY_DAEMON_BIN" ]; then
+    "$REACHY_DAEMON_BIN" --serialport "$port" "$@" &
+else
+    "$UV_BIN" run reachy-mini-daemon --serialport "$port" "$@" &
+fi
 daemon_pid=$!
 
 stop_daemon() {

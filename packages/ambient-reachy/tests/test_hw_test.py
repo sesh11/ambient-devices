@@ -9,8 +9,9 @@ import numpy as np
 import pytest
 from reachy_mini.utils import create_head_pose
 
-from ambient_home import hw_test
-from ambient_home.hw_test import (
+from ambient_reachy import hw_test
+from ambient_reachy._events import EventLog
+from ambient_reachy.hw_test import (
     FAIL,
     PASS,
     SKIP,
@@ -24,7 +25,6 @@ from ambient_home.hw_test import (
     format_markdown,
     rotation_between_deg,
 )
-from ambient_home.telemetry import EventLog
 
 
 def _fail() -> str:
@@ -155,6 +155,135 @@ def test_main_writes_reports_and_returns_exit_code(tmp_path: Path, monkeypatch: 
     assert events[-1].data["ok"] is False
 
 
+def test_wake_check_skips_without_hub_command(tmp_path: Path) -> None:
+    from ambient_reachy.hw_test import CheckSkipped, check_wake_word
+    from ambient_reachy.settings import KitSettings
+
+    with pytest.raises(CheckSkipped, match="needs --hub-command \\(wake word runs in ambient-home\\)"):
+        check_wake_word(KitSettings(events_dir=tmp_path), EventLog(tmp_path), 1.0, False)
+
+
+def test_live_check_requires_hub_command(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from ambient_reachy.hw_test import CheckFailed, check_live
+    from ambient_reachy.settings import KitSettings
+
+    with pytest.raises(CheckFailed, match="--live requires AMBIENT_HUB_COMMAND"):
+        check_live(KitSettings(events_dir=tmp_path), EventLog(tmp_path), 1.0, False)
+    monkeypatch.delenv("AMBIENT_HUB_COMMAND", raising=False)
+    assert hw_test.main(["--live", "--no-pause"]) == 2
+
+
+def test_speech_heard_prompts_or_uses_say(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    from ambient_reachy import mic_check
+    from ambient_reachy.hw_test import check_speech_heard
+
+    monkeypatch.setattr(mic_check, "probe_microphone", lambda seconds: mic_check.MicProbe(10, 1600, 0.1, 0.2, "ok"))
+    monkeypatch.setattr(hw_test.shutil, "which", lambda name: "/usr/bin/say")
+    monkeypatch.setattr(
+        hw_test.subprocess,
+        "Popen",
+        lambda command, **kwargs: type(
+            "Speaker",
+            (),
+            {"poll": lambda self: 0, "terminate": lambda self: None},
+        )(),
+    )
+
+    assert "verdict=ok" in check_speech_heard(0.1, "hey_jarvis", False)
+    assert "say 'hey jarvis' now" in capsys.readouterr().out
+    assert "verdict=ok" in check_speech_heard(0.1, "hey_jarvis", True)
+
+
+def test_hub_wake_uses_hub_events_and_clears_openai_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from ambient_reachy.settings import KitSettings
+
+    event_log = EventLog(tmp_path / "events")
+
+    class Process:
+        returncode = None
+        polls = 0
+        env: dict[str, str] = {}
+        terminated = False
+
+        def poll(self) -> int | None:
+            self.polls += 1
+            if self.polls == 1:
+                event_log.emit("app.started", "app")
+            elif self.polls == 2:
+                event_log.emit("wake.detected", "live")
+            return None
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def wait(self, timeout: float) -> int:
+            del timeout
+            return 0
+
+        def kill(self) -> None:
+            self.terminated = True
+
+    process = Process()
+
+    def popen(command, *, env, **kwargs):
+        del kwargs
+        assert command == ["python", "-m", "ambient_home"]
+        process.env = env
+        return process
+
+    monkeypatch.setattr(hw_test.shutil, "which", lambda name: None)
+    detail = hw_test.check_wake_word(
+        KitSettings(events_dir=tmp_path / "events", hub_command="python -m ambient_home"),
+        event_log,
+        1.0,
+        False,
+        popen=popen,
+    )
+
+    assert "wake detected by hub" in detail
+    assert process.env["OPENAI_API_KEY"] == ""
+    assert process.env["AMBIENT_EVENTS_DIR"] == str(tmp_path / "events")
+    assert process.terminated
+
+
+def test_hub_wake_fails_on_timeout_or_early_exit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from ambient_reachy.hw_test import CheckFailed
+    from ambient_reachy.settings import KitSettings
+
+    settings = KitSettings(events_dir=tmp_path / "events", hub_command="fake-hub")
+    log = EventLog(tmp_path / "events")
+    clock = [0.0]
+    monkeypatch.setattr(hw_test.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(hw_test.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+
+    class Process:
+        returncode = None
+        terminated = False
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def wait(self, timeout: float) -> int:
+            del timeout
+            return 0
+
+        def kill(self) -> None:
+            self.terminated = True
+
+    process = Process()
+    with pytest.raises(CheckFailed, match="did not emit app.started"):
+        hw_test.check_wake_word(settings, log, 1.0, False, popen=lambda *args, **kwargs: process)
+    assert process.terminated
+
+    process.returncode = 1
+    clock[0] = 0.0
+    with pytest.raises(CheckFailed, match="hub exited early with code 1"):
+        hw_test.check_wake_word(settings, log, 1.0, False, popen=lambda *args, **kwargs: process)
+
+
 def test_settled_pose_waits_for_pose_to_stop_moving(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(hw_test.time, "sleep", lambda seconds: None)
     pitches = iter([2.0, 6.0, 9.0, 9.9, 10.0, 10.0])
@@ -165,7 +294,7 @@ def test_settled_pose_waits_for_pose_to_stop_moving(monkeypatch: pytest.MonkeyPa
 
 
 def _mic_probe(verdict: str, frames: int = 100) -> object:
-    from ambient_home.mic_check import MicProbe
+    from ambient_reachy.mic_check import MicProbe
 
     return MicProbe(
         frames=frames, samples=frames * 160, rms=0.0, peak=0.01 if verdict == "ok" else 0.0, verdict=verdict
@@ -173,22 +302,22 @@ def _mic_probe(verdict: str, frames: int = 100) -> object:
 
 
 def test_check_microphone_reboots_xmos_once_when_silent(monkeypatch: pytest.MonkeyPatch) -> None:
-    from ambient_home import mic_check
+    from ambient_reachy import mic_check
 
     probes = iter([_mic_probe("silent"), _mic_probe("ok")])
     reboots: list[bool] = []
     monkeypatch.setattr(mic_check, "probe_microphone", lambda seconds: next(probes))
-    monkeypatch.setattr(mic_check, "restart_audio_processor", lambda: reboots.append(True) or True)
+    monkeypatch.setattr(mic_check, "restart_audio_processor", lambda **kwargs: reboots.append(True) or True)
 
     assert "silent until XMOS reboot" in hw_test.check_microphone(1.0)
     assert reboots == [True]
 
 
 def test_check_microphone_fails_when_still_silent(monkeypatch: pytest.MonkeyPatch) -> None:
-    from ambient_home import mic_check
+    from ambient_reachy import mic_check
 
     monkeypatch.setattr(mic_check, "probe_microphone", lambda seconds: _mic_probe("silent"))
-    monkeypatch.setattr(mic_check, "restart_audio_processor", lambda: True)
+    monkeypatch.setattr(mic_check, "restart_audio_processor", lambda **kwargs: True)
 
     with pytest.raises(CheckFailed, match="cable"):
         hw_test.check_microphone(1.0)

@@ -2,8 +2,7 @@
 
 import httpx
 
-from ambient_home import daemon
-from ambient_home.daemon import watch_daemon, wait_for_daemon, fetch_daemon_state
+from ambient_reachy.daemon import watch_daemon, wait_for_daemon, fetch_daemon_state
 
 
 def _client(states: list[object]) -> httpx.AsyncClient:
@@ -51,29 +50,45 @@ async def test_watch_daemon_reports_loss_after_consecutive_failures() -> None:
 
 async def test_watch_daemon_emits_failure_and_loss_events(monkeypatch) -> None:
     events: list[tuple[str, str, dict[str, object]]] = []
-    monkeypatch.setattr(
-        daemon, "emit", lambda name, component, level="info", **data: events.append((name, level, data))
-    )
+
+    def emit(name: str, component: str, level: str = "info", **data: object) -> None:
+        events.append((name, level, data))
 
     async def on_lost(state: str) -> None:
         return
 
     async with _client([None, None]) as client:
-        await watch_daemon("http://d/status", poll_s=0.0, max_failures=2, on_lost=on_lost, client=client)
+        await watch_daemon("http://d/status", poll_s=0.0, max_failures=2, on_lost=on_lost, client=client, emit=emit)
 
     assert [name for name, _, _ in events] == ["daemon.check_failed", "daemon.check_failed", "daemon.lost"]
     assert events[-1][1] == "error"
 
 
-def test_exit_process_emits_before_os_exit(monkeypatch) -> None:
-    calls: list[str] = []
-    monkeypatch.setattr(
-        daemon,
-        "emit",
-        lambda name, component, level="info", **data: calls.append(f"event:{name}:{data['code']}"),
-    )
-    monkeypatch.setattr(daemon.os, "_exit", lambda code: calls.append(f"exit:{code}"))
+async def test_watch_daemon_emits_recovered_and_ready_before_later_loss() -> None:
+    events: list[tuple[str, str]] = []
 
-    daemon.exit_process(75, "restart")
+    def emit(name: str, component: str, level: str = "info", **data: object) -> None:
+        del component, data
+        events.append((name, level))
 
-    assert calls == ["event:process.exit:75", "exit:75"]
+    async def on_lost(state: str) -> None:
+        assert state == "unreachable"
+
+    async with _client([None, "running", None, None]) as client:
+        await watch_daemon(
+            "http://d/status",
+            poll_s=0.0,
+            max_failures=2,
+            on_lost=on_lost,
+            client=client,
+            emit=emit,
+        )
+
+    assert [name for name, _ in events] == [
+        "daemon.check_failed",
+        "daemon.recovered",
+        "daemon.ready",
+        "daemon.check_failed",
+        "daemon.check_failed",
+        "daemon.lost",
+    ]
