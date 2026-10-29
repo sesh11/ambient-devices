@@ -232,6 +232,8 @@ class ReachyDevice:
         source_rate = await asyncio.to_thread(media.get_input_audio_samplerate)
         while True:
             frame = await asyncio.to_thread(media.get_audio_sample)
+            if self._daemon_lost or not self._started:
+                return
             if frame is None:
                 await asyncio.sleep(0.01)
                 continue
@@ -245,9 +247,10 @@ class ReachyDevice:
                 self._silence_seconds += samples.size / SAMPLE_RATE
                 if self._silence_seconds >= self.config.silence_alarm_s and not self._silence_event_sent:
                     logger.error(
-                        "Microphone has delivered only zeros for 5 s. Known Reachy Mini Lite XMOS startup fault "
+                        "Microphone has delivered only zeros for %.0f s. Known Reachy Mini Lite XMOS startup fault "
                         "(pollen-robotics/reachy_mini#770). Run `ambient-reachy-mic-check --reboot-xmos`, then "
-                        "restart ambient-home; if still silent, check the microphone FPC cable."
+                        "restart ambient-home; if still silent, check the microphone FPC cable.",
+                        self.config.silence_alarm_s,
                     )
                     self.context.emit("mic.silent_stream", "live", "error", seconds=self._silence_seconds)
                     self._mic_silent = True
@@ -265,8 +268,9 @@ class ReachyDevice:
 
     async def mic(self) -> AsyncIterator[bytes]:
         """Yield PCM16 chunks until stopped or the daemon connection is lost."""
+        queue = self._mic_queue
         while True:
-            chunk = await self._mic_queue.get()
+            chunk = await queue.get()
             if chunk is None:
                 return
             yield chunk
@@ -402,6 +406,13 @@ class ReachyDevice:
 
     async def _daemon_failed(self, state: str) -> None:
         self._daemon_lost = True
+        mic_task = self._mic_task
+        if mic_task is not None:
+            if mic_task is not asyncio.current_task():
+                mic_task.cancel()
+                await asyncio.gather(mic_task, return_exceptions=True)
+            if self._mic_task is mic_task:
+                self._mic_task = None
         self._end_mic_stream()
         await self.stop_playback()
         logger.error("Reachy daemon lost (state=%s); device will be restarted by the hub", state)

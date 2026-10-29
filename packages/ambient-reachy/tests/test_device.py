@@ -29,9 +29,17 @@ from ambient_reachy.body_tools import build_body_tools
 
 
 class FakeMedia:
-    def __init__(self, frames: Iterable[tuple[int, np.ndarray]] = (), *, fail_play_start: bool = False) -> None:
+    def __init__(
+        self,
+        frames: Iterable[tuple[int, np.ndarray]] = (),
+        *,
+        fail_play_start: bool = False,
+        repeat: bool = False,
+    ) -> None:
         self.frames = deque(frames)
         self.sample_rate = self.frames[0][0] if self.frames else 16_000
+        self.repeat_frame = self.frames[0] if repeat and self.frames else None
+        self.read_count = 0
         self.fail_play_start = fail_play_start
         self.pushed: list[np.ndarray] = []
         self.clears = 0
@@ -54,7 +62,11 @@ class FakeMedia:
         self.playing = False
 
     def get_audio_sample(self) -> np.ndarray | None:
+        self.read_count += 1
         if not self.frames:
+            if self.repeat_frame is not None:
+                self.sample_rate, frame = self.repeat_frame
+                return frame
             return None
         self.sample_rate, frame = self.frames.popleft()
         return frame
@@ -253,8 +265,10 @@ async def test_failed_startup_releases_robot_and_allows_retry(monkeypatch: pytes
 
 async def test_audio_worker_emits_single_silence_alarm_and_recovers_health(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     _patch_daemon(monkeypatch)
+    caplog.set_level(logging.ERROR, logger="ambient_reachy.device")
     events: list[tuple[str, str, dict[str, object]]] = []
 
     def emit(name: str, component: str, level: str = "info", **data: object) -> None:
@@ -262,11 +276,12 @@ async def test_audio_worker_emits_single_silence_alarm_and_recovers_health(
 
     samples = np.zeros(80_000, dtype=np.float32)
     robot = _robot([(16_000, samples), (16_000, samples)])
-    device = _device(robot, emit=emit)
+    device = _device(robot, emit=emit, config={"silence_alarm_s": 3.0})
     await device.start()
     await asyncio.sleep(0.05)
 
     assert [name for name, _, _ in events].count("mic.silent_stream") == 1
+    assert "Microphone has delivered only zeros for 3 s" in caplog.text
     assert (await device.health()).status is HealthStatus.DEGRADED
     await device.stop()
 
@@ -422,6 +437,62 @@ async def test_daemon_loss_marks_down_and_ends_audio(monkeypatch: pytest.MonkeyP
         await device.play(b"\0\0")
     with pytest.raises(StopAsyncIteration):
         await anext(device.mic())
+    await device.stop()
+
+
+async def test_daemon_loss_cancels_fast_mic_producer_and_slow_consumer_ends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_daemon(monkeypatch)
+    media = FakeMedia([(16_000, np.full(160, 0.1, dtype=np.float32))], repeat=True)
+    robot = FakeRobot(media, [])
+    hardware = FakeHardware([robot])
+    device = ReachyDevice(
+        DeviceContext("reachy-test", {"mic_autorecover": False, "camera": False, "body_tools": []}),
+        hardware=hardware,
+    )
+    await device.start()
+    stream = device.mic()
+    assert await anext(stream)
+    deadline = asyncio.get_running_loop().time() + 1.0
+    while media.read_count <= 20 and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.001)
+    assert media.read_count > 20
+    assert device._mic_queue.full()
+
+    await device._daemon_failed("unreachable")
+
+    with pytest.raises(StopAsyncIteration):
+        async with asyncio.timeout(1.0):
+            while True:
+                await anext(stream)
+    await device.stop()
+
+
+async def test_mic_consumer_remains_bound_to_queue_across_restart(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_daemon(monkeypatch)
+    first, second = _robot(), _robot()
+    device = ReachyDevice(
+        DeviceContext("reachy-test", {"mic_autorecover": False, "camera": False, "body_tools": []}),
+        hardware=FakeHardware([first, second]),
+    )
+    await device.start()
+    stream = device.mic()
+
+    async def receive_first() -> bytes:
+        return await anext(stream)
+
+    first_chunk = asyncio.create_task(receive_first())
+    await asyncio.sleep(0)
+    old_queue = device._mic_queue
+    old_queue.put_nowait(b"first")
+    assert await first_chunk == b"first"
+
+    await device.stop()
+    await device.start()
+
+    with pytest.raises(StopAsyncIteration):
+        await asyncio.wait_for(anext(stream), timeout=1.0)
     await device.stop()
 
 

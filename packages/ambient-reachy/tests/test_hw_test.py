@@ -173,6 +173,128 @@ def test_live_check_requires_hub_command(tmp_path: Path, monkeypatch: pytest.Mon
     assert hw_test.main(["--live", "--no-pause"]) == 2
 
 
+def test_live_check_waits_for_live_session_and_preserves_paid_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    from ambient_reachy.settings import KitSettings
+
+    event_log = EventLog(tmp_path / "events")
+    sleeps: list[float] = []
+
+    class Process:
+        polls = 0
+        terminated = False
+        env: dict[str, str] = {}
+
+        def poll(self) -> int | None:
+            self.polls += 1
+            if self.polls == 1:
+                event_log.emit("app.started", "app")
+            elif self.polls == 2:
+                event_log.emit("live.session_started", "live")
+            elif self.polls == 3:
+                event_log.emit("tool.completed", "live", tool="dispatch_job")
+            return None
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def wait(self, timeout: float) -> int:
+            del timeout
+            return 0
+
+        def kill(self) -> None:
+            self.terminated = True
+
+    process = Process()
+
+    def popen(command, *, env, **kwargs):
+        del kwargs
+        assert command == ["python", "-m", "ambient_home", "--profile", "a profile"]
+        process.env = env
+        return process
+
+    monkeypatch.setenv("OPENAI_API_KEY", "fake-paid-test-key")
+    monkeypatch.setattr(hw_test.time, "sleep", sleeps.append)
+    detail = hw_test.check_live(
+        KitSettings(
+            events_dir=event_log.directory,
+            wake_word="hey_jarvis",
+            hub_command='python -m ambient_home --profile "a profile"',
+        ),
+        event_log,
+        15.0,
+        False,
+        popen=popen,
+    )
+
+    assert detail == "Live session opened; WARNING 1 dispatch_job call(s) during the test"
+    assert sleeps[0] == 0.5
+    assert 3.0 in sleeps
+    assert "say 'hey jarvis' now" in capsys.readouterr().out
+    assert process.env["OPENAI_API_KEY"] == "fake-paid-test-key"
+    assert process.env["AMBIENT_EVENTS_DIR"] == str(event_log.directory)
+    assert process.env["AMBIENT_IDLE_TIMEOUT_S"] == "8"
+    assert process.env["AMBIENT_MAX_SESSION_S"] == "20"
+    assert process.env["AMBIENT_HEARTBEAT_S"] == "30"
+    assert process.terminated
+
+
+def test_live_check_fails_on_early_exit_and_session_timeout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from ambient_reachy.hw_test import CheckFailed, check_live
+    from ambient_reachy.settings import KitSettings
+
+    settings = KitSettings(events_dir=tmp_path / "events", hub_command="fake-hub")
+    event_log = EventLog(settings.events_dir)
+
+    class Process:
+        returncode: int | None = 7
+        terminated = False
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def wait(self, timeout: float) -> int:
+            del timeout
+            return 0
+
+        def kill(self) -> None:
+            self.terminated = True
+
+    process = Process()
+    with pytest.raises(CheckFailed, match="hub exited early with code 7"):
+        check_live(settings, event_log, 1.0, False, popen=lambda *args, **kwargs: process)
+
+    process.returncode = None
+    process.terminated = False
+    clock = [0.0]
+
+    def emit_started_on_poll(*args, **kwargs):
+        del args, kwargs
+
+        class StartedProcess(Process):
+            returncode = None
+            polls = 0
+
+            def poll(self) -> int | None:
+                self.polls += 1
+                if self.polls == 1:
+                    event_log.emit("app.started", "app")
+                return None
+
+        return StartedProcess()
+
+    monkeypatch.setattr(hw_test.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(hw_test.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    with pytest.raises(CheckFailed, match="no Live session opened before the timeout"):
+        check_live(settings, event_log, 4.0, False, popen=emit_started_on_poll)
+
+
 def test_speech_heard_prompts_or_uses_say(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
     from ambient_reachy import mic_check
     from ambient_reachy.hw_test import check_speech_heard

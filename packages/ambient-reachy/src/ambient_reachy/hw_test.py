@@ -369,10 +369,58 @@ def check_live(
     speak: bool,
     popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
 ) -> str:
-    """Validate hub startup and wake detection without invoking paid Live APIs."""
+    """Run the hub briefly, wake it, and require a paid Live session to open."""
     if not settings.hub_command:
         raise CheckFailed("--live requires AMBIENT_HUB_COMMAND")
-    return _check_hub_wake(settings, event_log, timeout_s, speak, popen)
+    started_at = datetime.now(timezone.utc)
+    env = {
+        **os.environ,
+        "AMBIENT_EVENTS_DIR": str(event_log.directory),
+        "AMBIENT_IDLE_TIMEOUT_S": "8",
+        "AMBIENT_MAX_SESSION_S": "20",
+        "AMBIENT_HEARTBEAT_S": "30",
+    }
+    process = popen(shlex.split(settings.hub_command), env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    phrase = wake_phrase(settings.wake_word)
+
+    def seen(event_type: str) -> bool:
+        return any(event.type == event_type for event in event_log.read(started_at))
+
+    try:
+        deadline = time.monotonic() + timeout_s
+        while not seen("app.started"):
+            if process.poll() is not None:
+                raise CheckFailed(f"hub exited early with code {process.returncode}")
+            if time.monotonic() > deadline:
+                raise CheckFailed("hub did not start in time")
+            time.sleep(0.5)
+        time.sleep(3.0)
+        if speak and shutil.which("say"):
+            subprocess.run(["say", phrase], check=False)
+        else:
+            print(f"say '{phrase}' now")
+        while not seen("live.session_started"):
+            if process.poll() is not None:
+                raise CheckFailed(f"hub exited with code {process.returncode} before a Live session opened")
+            if time.monotonic() > deadline:
+                raise CheckFailed("no Live session opened before the timeout")
+            time.sleep(0.5)
+        detail = "Live session opened"
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+    dispatched = [
+        event
+        for event in event_log.read(started_at)
+        if event.type == "tool.completed" and event.data.get("tool") == "dispatch_job"
+    ]
+    if dispatched:
+        detail += f"; WARNING {len(dispatched)} dispatch_job call(s) during the test"
+    return detail
 
 
 def build_checks(
@@ -444,7 +492,7 @@ def format_markdown(results: Sequence[CheckResult], *, total_s: float, app_resto
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the hardware checks and print a pass/fail table."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--live", action="store_true", help="also validate hub startup and wake detection")
+    parser.add_argument("--live", action="store_true", help="also verify that ambient-home opens a Live session")
     parser.add_argument("--no-pause", action="store_true", help="don't stop the always-on app LaunchAgent")
     parser.add_argument("--no-speak", action="store_true", help="don't use `say`; you speak the wake word")
     parser.add_argument("--mic-seconds", type=float, default=2.0)
