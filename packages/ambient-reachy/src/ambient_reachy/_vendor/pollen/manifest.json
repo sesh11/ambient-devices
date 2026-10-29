@@ -1,0 +1,55 @@
+{
+  "src/reachy_mini_conversation_app/__init__.py": {
+    "vendored": "__init__.py",
+    "sha256": "0ce125850deb6556fea0d19993c3b3b0fd641f97edf66e24598c5c9e1f50e52d"
+  },
+  "src/reachy_mini_conversation_app/moves.py": {
+    "vendored": "moves.py",
+    "sha256": "79311b727bc3e903a150ac2c2271320a670f08d8270d56ada6da76e911376cc6"
+  },
+  "src/reachy_mini_conversation_app/dance_emotion_moves.py": {
+    "vendored": "dance_emotion_moves.py",
+    "sha256": "feb7406f82affade3a8e84d413b89d30a15bd716a9b3375f0467599e14aa25ad"
+  },
+  "src/reachy_mini_conversation_app/tools/__init__.py": {
+    "vendored": "tools/__init__.py",
+    "sha256": "0ce125850deb6556fea0d19993c3b3b0fd641f97edf66e24598c5c9e1f50e52d"
+  },
+  "src/reachy_mini_conversation_app/tools/dance.py": {
+    "vendored": "tools/dance.py",
+    "sha256": "2516e5a439087c466d6c9fdfdccfd62cc35aaba9ef117a3a1a8c11b5bc900a17"
+  },
+  "src/reachy_mini_conversation_app/tools/stop_dance.py": {
+    "vendored": "tools/stop_dance.py",
+    "sha256": "0427d07c6067e1159808e51a0448c712cecdef709a00e55bb263a004de240fb3"
+  },
+  "src/reachy_mini_conversation_app/tools/play_emotion.py": {
+    "vendored": "tools/play_emotion.py",
+    "sha256": "b743d181191b790017b9c9aa2896e05141d0e4551453e24dddd717358389cabd"
+  },
+  "src/reachy_mini_conversation_app/tools/stop_emotion.py": {
+    "vendored": "tools/stop_emotion.py",
+    "sha256": "825b343fc9915a4d3bec334bdcd5c7700faac586f39227c79a20a89b63056c53"
+  },
+  "src/reachy_mini_conversation_app/tools/move_head.py": {
+    "vendored": "tools/move_head.py",
+    "sha256": "4379baa100a974d5ea8b7c8a676b30d46ce43f79b83ab3150b8470d9b4d574d3"
+  },
+  "src/reachy_mini_conversation_app/tools/sweep_look.py": {
+    "vendored": "tools/sweep_look.py",
+    "sha256": "8b8df0b4ce09ed840caf52ea31a890c3da5714543b164d9183aab58d457283fa"
+  },
+  "src/reachy_mini_conversation_app/tools/head_tracking.py": {
+    "vendored": "tools/head_tracking.py",
+    "sha256": "b9d25659ef4f54a1efa5d24a2d948362339c5425b0bf6a86588ffd1e60e4260b"
+  },
+  "LICENSE": {
+    "vendored": "LICENSE",
+    "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+  },
+  "src/reachy_mini_conversation_app/tools/core_tools.py": {
+    "vendored": "tools/_base.py",
+    "sha256": "45ff2949dd38893956cea8ecfe90e595b84d12e471a83e12bef654ed63a7846c",
+    "derived": true
+  }
+}

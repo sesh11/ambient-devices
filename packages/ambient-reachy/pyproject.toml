@@ -10,7 +10,8 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "ambient-device-sdk @ git+https://github.com/sesh11/ambient-home.git@a26fb92de1060f7e7b0e3211f596fab8a5718fad#subdirectory=packages/ambient-device-sdk",
-    "reachy-mini-conversation-app @ git+https://github.com/pollen-robotics/reachy_mini_conversation_app.git@f885bf421764ff7ff18dff26ae77b24b99a3af8c",
+    "reachy-mini>=1.13.0,<2",
+    "reachy-mini-dances-library>=0.2.1,<0.3",
     "numpy",
     "httpx",
     "python-dotenv",
@@ -33,4 +34,11 @@ include-package-data = true
 where = ["src"]
 
 [tool.setuptools.package-data]
-ambient_reachy = ["py.typed", "launchd/*.plist", "scripts/*.sh"]
+ambient_reachy = [
+    "py.typed",
+    "launchd/*.plist",
+    "scripts/*.sh",
+    "_vendor/pollen/LICENSE",
+    "_vendor/pollen/NOTICE",
+    "_vendor/pollen/manifest.json",
+]

@@ -1,0 +1,33 @@
+Provider-free movement and tool subset vendored from
+https://github.com/pollen-robotics/reachy_mini_conversation_app
+at commit f885bf421764ff7ff18dff26ae77b24b99a3af8c.
+
+Destination paths below are relative to ambient_reachy/_vendor/pollen/.
+
+src/reachy_mini_conversation_app/__init__.py -> __init__.py
+src/reachy_mini_conversation_app/moves.py -> moves.py
+src/reachy_mini_conversation_app/dance_emotion_moves.py -> dance_emotion_moves.py
+src/reachy_mini_conversation_app/tools/__init__.py -> tools/__init__.py
+src/reachy_mini_conversation_app/tools/dance.py -> tools/dance.py
+src/reachy_mini_conversation_app/tools/stop_dance.py -> tools/stop_dance.py
+src/reachy_mini_conversation_app/tools/play_emotion.py -> tools/play_emotion.py
+src/reachy_mini_conversation_app/tools/stop_emotion.py -> tools/stop_emotion.py
+src/reachy_mini_conversation_app/tools/move_head.py -> tools/move_head.py
+src/reachy_mini_conversation_app/tools/sweep_look.py -> tools/sweep_look.py
+src/reachy_mini_conversation_app/tools/head_tracking.py -> tools/head_tracking.py
+LICENSE -> LICENSE
+src/reachy_mini_conversation_app/tools/core_tools.py -> tools/_base.py (derived)
+
+Import rewrites only:
+- reachy_mini_conversation_app.tools.core_tools -> ambient_reachy._vendor.pollen.tools._base
+- reachy_mini_conversation_app.dance_emotion_moves -> ambient_reachy._vendor.pollen.dance_emotion_moves
+
+The core_tools import was rewritten in tools/dance.py, tools/stop_dance.py,
+tools/play_emotion.py, tools/stop_emotion.py, tools/move_head.py,
+tools/sweep_look.py, and tools/head_tracking.py. The dance_emotion_moves
+import was rewritten in moves.py, tools/dance.py, tools/play_emotion.py,
+tools/move_head.py, and tools/sweep_look.py. No other imports were changed.
+
+tools/_base.py is derived from the upstream ToolDependencies and Tool classes.
+The original configuration, MCP integrations, tool-space and profile loading,
+dynamic imports, and tool registries were removed.

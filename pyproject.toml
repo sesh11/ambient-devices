@@ -12,7 +12,16 @@ dev = [
 
 [tool.ruff]
 line-length = 119
-exclude = [".venv", "dist", "build", "**/__pycache__", "*.egg-info", ".mypy_cache", ".pytest_cache"]
+exclude = [
+    ".venv",
+    "dist",
+    "build",
+    "**/__pycache__",
+    "*.egg-info",
+    ".mypy_cache",
+    ".pytest_cache",
+    "**/_vendor/**",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "C4", "D"]
@@ -42,6 +51,10 @@ allow_subclassing_any = true
 strict = true
 show_error_codes = true
 warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module = ["ambient_reachy._vendor.*"]
+ignore_errors = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

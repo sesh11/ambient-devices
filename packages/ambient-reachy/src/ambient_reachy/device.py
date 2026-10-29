@@ -51,7 +51,7 @@ class _DefaultHardware:
         return ReachyMini()
 
     def make_movement_manager(self, robot: Any) -> Any:
-        from reachy_mini_conversation_app.moves import MovementManager
+        from ambient_reachy._vendor.pollen.moves import MovementManager
 
         return MovementManager(current_robot=robot)
 

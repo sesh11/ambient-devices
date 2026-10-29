@@ -217,6 +217,11 @@ def test_live_check_waits_for_live_session_and_preserves_paid_environment(
         return process
 
     monkeypatch.setenv("OPENAI_API_KEY", "fake-paid-test-key")
+    monkeypatch.setenv("DEVIN_API_KEY", "fake-devin-test-key")
+    monkeypatch.setenv("DEVIN_ORG_ID", "fake-org-test-id")
+    monkeypatch.setenv("AMBIENT_GARAGE_URL", "https://fake-garage.invalid")
+    monkeypatch.setenv("AMBIENT_DATA_DIR", "/existing/ambient-data")
+    monkeypatch.setenv("AMBIENT_DEVICES_FILE", "/existing/devices.toml")
     monkeypatch.setattr(hw_test.time, "sleep", sleeps.append)
     detail = hw_test.check_live(
         KitSettings(
@@ -228,6 +233,7 @@ def test_live_check_waits_for_live_session_and_preserves_paid_environment(
         15.0,
         False,
         popen=popen,
+        hub_env=(("AMBIENT_IDLE_TIMEOUT_S", "11"), ("REACHY_TEST_ENV", "live=value")),
     )
 
     assert detail == "Live session opened; WARNING 1 dispatch_job call(s) during the test"
@@ -236,9 +242,15 @@ def test_live_check_waits_for_live_session_and_preserves_paid_environment(
     assert "say 'hey jarvis' now" in capsys.readouterr().out
     assert process.env["OPENAI_API_KEY"] == "fake-paid-test-key"
     assert process.env["AMBIENT_EVENTS_DIR"] == str(event_log.directory)
-    assert process.env["AMBIENT_IDLE_TIMEOUT_S"] == "8"
+    assert process.env["AMBIENT_IDLE_TIMEOUT_S"] == "11"
     assert process.env["AMBIENT_MAX_SESSION_S"] == "20"
     assert process.env["AMBIENT_HEARTBEAT_S"] == "30"
+    assert process.env["DEVIN_API_KEY"] == "fake-devin-test-key"
+    assert process.env["DEVIN_ORG_ID"] == "fake-org-test-id"
+    assert process.env["AMBIENT_GARAGE_URL"] == "https://fake-garage.invalid"
+    assert process.env["AMBIENT_DATA_DIR"] == "/existing/ambient-data"
+    assert process.env["AMBIENT_DEVICES_FILE"] == "/existing/devices.toml"
+    assert process.env["REACHY_TEST_ENV"] == "live=value"
     assert process.terminated
 
 
@@ -316,7 +328,9 @@ def test_speech_heard_prompts_or_uses_say(monkeypatch: pytest.MonkeyPatch, capsy
     assert "verdict=ok" in check_speech_heard(0.1, "hey_jarvis", True)
 
 
-def test_hub_wake_uses_hub_events_and_clears_openai_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_hub_wake_blanks_provider_keys_and_preserves_unrelated_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from ambient_reachy.settings import KitSettings
 
     event_log = EventLog(tmp_path / "events")
@@ -354,18 +368,120 @@ def test_hub_wake_uses_hub_events_and_clears_openai_key(tmp_path: Path, monkeypa
         return process
 
     monkeypatch.setattr(hw_test.shutil, "which", lambda name: None)
+    monkeypatch.setenv("OPENAI_API_KEY", "paid-key-must-not-leak")
+    monkeypatch.setenv("DEVIN_API_KEY", "devin-key-must-not-leak")
+    monkeypatch.setenv("DEVIN_ORG_ID", "org-id-must-not-leak")
+    monkeypatch.setenv("AMBIENT_GARAGE_URL", "https://garage.invalid")
+    monkeypatch.setenv("AMBIENT_DATA_DIR", "/existing/ambient-data")
+    monkeypatch.setenv("AMBIENT_DEVICES_FILE", "/existing/devices.toml")
     detail = hw_test.check_wake_word(
         KitSettings(events_dir=tmp_path / "events", hub_command="python -m ambient_home"),
         event_log,
         1.0,
         False,
         popen=popen,
+        hub_env=(("REACHY_TEST_ENV", "free=value"),),
     )
 
     assert "wake detected by hub" in detail
     assert process.env["OPENAI_API_KEY"] == ""
+    assert process.env["DEVIN_API_KEY"] == ""
+    assert process.env["DEVIN_ORG_ID"] == ""
+    assert process.env["AMBIENT_GARAGE_URL"] == ""
     assert process.env["AMBIENT_EVENTS_DIR"] == str(tmp_path / "events")
+    assert process.env["AMBIENT_DATA_DIR"] == "/existing/ambient-data"
+    assert process.env["AMBIENT_DEVICES_FILE"] == "/existing/devices.toml"
+    assert process.env["REACHY_TEST_ENV"] == "free=value"
     assert process.terminated
+
+
+@pytest.mark.parametrize("key", ["OPENAI_API_KEY", "DEVIN_API_KEY", "DEVIN_ORG_ID", "AMBIENT_GARAGE_URL"])
+def test_hub_env_cannot_reset_free_check_secrets(key: str, capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        hw_test.main(["--hub-env", f"{key}=must-not-be-set"])
+
+    assert exit_info.value.code == 2
+    assert f"--hub-env cannot override {key} during the free wake check" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [("NO_EQUALS", "expected KEY=VALUE"), ("=empty-key", "KEY must not be empty")],
+)
+def test_hub_env_malformed_values_exit_two(value: str, message: str, capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        hw_test.main(["--hub-env", value])
+
+    assert exit_info.value.code == 2
+    assert message in capsys.readouterr().err
+
+
+def test_build_checks_passes_hub_env_to_both_hub_checks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from ambient_reachy.settings import KitSettings
+
+    received: list[tuple[str, tuple[tuple[str, str], ...]]] = []
+    pairs = (("AMBIENT_DATA_DIR", "/isolated/data"), ("AMBIENT_DEVICES_FILE", "/isolated/devices.toml"))
+
+    def free_check(*args, hub_env=(), **kwargs) -> str:
+        del args, kwargs
+        received.append(("wake", tuple(hub_env)))
+        return "wake"
+
+    def live_check(*args, hub_env=(), **kwargs) -> str:
+        del args, kwargs
+        received.append(("live", tuple(hub_env)))
+        return "live"
+
+    monkeypatch.setattr(hw_test, "check_daemon", lambda settings: "daemon")
+    monkeypatch.setattr(hw_test, "check_audio_device", lambda: "audio")
+    monkeypatch.setattr(hw_test, "check_microphone", lambda seconds: "mic")
+    monkeypatch.setattr(hw_test, "check_speech_heard", lambda *args: "speech")
+    monkeypatch.setattr(hw_test, "check_wake_word", free_check)
+    monkeypatch.setattr(hw_test, "check_head", lambda: "head")
+    monkeypatch.setattr(hw_test, "check_live", live_check)
+    checks = hw_test.build_checks(
+        KitSettings(events_dir=tmp_path / "events", hub_command="fake-hub"),
+        EventLog(tmp_path / "events"),
+        "run",
+        mic_seconds=1,
+        wake_timeout_s=1,
+        speak=False,
+        live=True,
+        live_timeout_s=1,
+        hub_env=pairs,
+    )
+
+    run_checks(checks)
+
+    assert received == [("wake", pairs), ("live", pairs)]
+
+
+def test_main_parses_repeatable_hub_env_values(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AMBIENT_EVENTS_DIR", str(tmp_path / "events"))
+    captured: dict[str, object] = {}
+
+    def build_checks(*args, **kwargs):
+        del args
+        captured.update(kwargs)
+        return [Check("ok", lambda: "fine")]
+
+    monkeypatch.setattr(hw_test, "build_checks", build_checks)
+
+    assert (
+        hw_test.main(["--no-pause", "--hub-env", "CUSTOM=first=value", "--hub-env", "AMBIENT_DATA_DIR=/isolated"]) == 0
+    )
+    assert captured["hub_env"] == [("CUSTOM", "first=value"), ("AMBIENT_DATA_DIR", "/isolated")]
+
+
+def test_hub_env_help_documents_per_run_isolation(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        hw_test.main(["--help"])
+
+    assert exit_info.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "--hub-env" in help_text
+    assert "AMBIENT_DATA_DIR" in help_text
+    assert "AMBIENT_DEVICES_FILE" in help_text
 
 
 def test_hub_wake_fails_on_timeout_or_early_exit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

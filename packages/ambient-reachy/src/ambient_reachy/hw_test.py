@@ -33,6 +33,17 @@ SKIP = "skip"
 _HEAD_NOD_DEG = 10.0
 _HEAD_MIN_MOVE_DEG = 3.0
 _WAKE_ATTEMPTS = 2
+_WAKE_HUB_ENV_LOCKED = frozenset({"OPENAI_API_KEY", "DEVIN_API_KEY", "DEVIN_ORG_ID", "AMBIENT_GARAGE_URL"})
+
+
+def _parse_hub_env(value: str) -> tuple[str, str]:
+    """Parse one KEY=VALUE hub environment override."""
+    if "=" not in value:
+        raise argparse.ArgumentTypeError("expected KEY=VALUE")
+    key, env_value = value.split("=", 1)
+    if not key:
+        raise argparse.ArgumentTypeError("KEY must not be empty")
+    return key, env_value
 
 
 @dataclass(frozen=True)
@@ -281,16 +292,25 @@ def _check_hub_wake(
     timeout_s: float,
     speak: bool,
     popen: Callable[..., subprocess.Popen[bytes]],
+    hub_env: Sequence[tuple[str, str]] = (),
 ) -> str:
     """Run the configured hub, speak the wake phrase, and require its wake event."""
     if not settings.hub_command:
         raise CheckSkipped("needs --hub-command (wake word runs in ambient-home)")
+    locked_overrides = _WAKE_HUB_ENV_LOCKED.intersection(key for key, _ in hub_env)
+    if locked_overrides:
+        key = sorted(locked_overrides)[0]
+        raise CheckFailed(f"--hub-env cannot override {key} during the free wake check")
     started_at = datetime.now(timezone.utc)
     env = {
         **os.environ,
         "AMBIENT_EVENTS_DIR": str(event_log.directory),
         "OPENAI_API_KEY": "",
+        "DEVIN_API_KEY": "",
+        "DEVIN_ORG_ID": "",
+        "AMBIENT_GARAGE_URL": "",
     }
+    env.update(hub_env)
     process = popen(shlex.split(settings.hub_command), env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     phrase = wake_phrase(settings.wake_word)
     speaker: subprocess.Popen[bytes] | None = None
@@ -357,9 +377,11 @@ def check_wake_word(
     timeout_s: float,
     speak: bool,
     popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
+    *,
+    hub_env: Sequence[tuple[str, str]] = (),
 ) -> str:
     """Exercise the hub's own wake-word detector when a hub command is configured."""
-    return _check_hub_wake(settings, event_log, timeout_s, speak, popen)
+    return _check_hub_wake(settings, event_log, timeout_s, speak, popen, hub_env)
 
 
 def check_live(
@@ -368,6 +390,8 @@ def check_live(
     timeout_s: float,
     speak: bool,
     popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
+    *,
+    hub_env: Sequence[tuple[str, str]] = (),
 ) -> str:
     """Run the hub briefly, wake it, and require a paid Live session to open."""
     if not settings.hub_command:
@@ -380,6 +404,7 @@ def check_live(
         "AMBIENT_MAX_SESSION_S": "20",
         "AMBIENT_HEARTBEAT_S": "30",
     }
+    env.update(hub_env)
     process = popen(shlex.split(settings.hub_command), env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     phrase = wake_phrase(settings.wake_word)
 
@@ -433,6 +458,7 @@ def build_checks(
     speak: bool,
     live: bool,
     live_timeout_s: float,
+    hub_env: Sequence[tuple[str, str]] = (),
 ) -> list[Check]:
     """Return the hardware checks in the order they run."""
     checks = [
@@ -447,7 +473,7 @@ def build_checks(
         ),
         Check(
             "wake word",
-            lambda: check_wake_word(settings, event_log, wake_timeout_s, speak),
+            lambda: check_wake_word(settings, event_log, wake_timeout_s, speak, hub_env=hub_env),
             needs=("daemon", "microphone"),
         ),
         Check("head", check_head, needs=("daemon",)),
@@ -456,7 +482,7 @@ def build_checks(
         checks.append(
             Check(
                 "live session",
-                lambda: check_live(settings, event_log, live_timeout_s, speak),
+                lambda: check_live(settings, event_log, live_timeout_s, speak, hub_env=hub_env),
                 needs=("daemon", "wake word"),
             )
         )
@@ -499,9 +525,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--wake-timeout", type=float, default=15.0)
     parser.add_argument("--live-timeout", type=float, default=60.0)
     parser.add_argument("--hub-command", default=None, help="command to start ambient-home for wake checks")
+    parser.add_argument(
+        "--hub-env",
+        action="append",
+        type=_parse_hub_env,
+        default=[],
+        metavar="KEY=VALUE",
+        help="set a hub subprocess environment value (repeatable; pass AMBIENT_DATA_DIR and AMBIENT_DEVICES_FILE for per-run isolation)",
+    )
     parser.add_argument("--markdown", type=Path, default=None, help="write a scrubbed Markdown summary here")
     parser.add_argument("--json", type=Path, default=None, help="write machine-readable results here")
     args = parser.parse_args(argv)
+    locked_overrides = _WAKE_HUB_ENV_LOCKED.intersection(key for key, _ in args.hub_env)
+    if locked_overrides:
+        key = sorted(locked_overrides)[0]
+        parser.error(f"--hub-env cannot override {key} during the free wake check")
 
     settings = KitSettings.from_env()
     if args.hub_command:
@@ -521,6 +559,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         speak=not args.no_speak,
         live=args.live,
         live_timeout_s=args.live_timeout,
+        hub_env=args.hub_env,
     )
     pause = PausedApp(enabled=not args.no_pause)
     try:

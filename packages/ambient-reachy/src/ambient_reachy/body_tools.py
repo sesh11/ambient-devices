@@ -11,21 +11,21 @@ logger = logging.getLogger(__name__)
 
 def build_body_tools(
     names: tuple[str, ...],
-    robot: object,
-    movement_manager: object,
+    robot: Any,
+    movement_manager: Any,
     *,
     camera_enabled: bool,
     motion_duration_s: float,
 ) -> list[ToolSpec]:
     """Instantiate configured Pollen tool classes directly and adapt their handlers."""
-    from reachy_mini_conversation_app.tools.dance import Dance
-    from reachy_mini_conversation_app.tools.move_head import MoveHead
-    from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
-    from reachy_mini_conversation_app.tools.stop_dance import StopDance
-    from reachy_mini_conversation_app.tools.sweep_look import SweepLook
-    from reachy_mini_conversation_app.tools.play_emotion import PlayEmotion
-    from reachy_mini_conversation_app.tools.stop_emotion import StopEmotion
-    from reachy_mini_conversation_app.tools.head_tracking import HeadTracking
+    from ambient_reachy._vendor.pollen.tools._base import ToolDependencies
+    from ambient_reachy._vendor.pollen.tools.dance import Dance
+    from ambient_reachy._vendor.pollen.tools.move_head import MoveHead
+    from ambient_reachy._vendor.pollen.tools.stop_dance import StopDance
+    from ambient_reachy._vendor.pollen.tools.sweep_look import SweepLook
+    from ambient_reachy._vendor.pollen.tools.play_emotion import PlayEmotion
+    from ambient_reachy._vendor.pollen.tools.stop_emotion import StopEmotion
+    from ambient_reachy._vendor.pollen.tools.head_tracking import HeadTracking
 
     classes: dict[str, type[Any]] = {
         "dance": Dance,

@@ -725,7 +725,7 @@ load_plugin('reachy-mini-lite')
 from ambient_reachy.plugin import PLUGIN
 device = PLUGIN.create(DeviceContext('reachy-test', {'camera': False}))
 assert device.id == 'reachy-test'
-for name in ('reachy_mini', 'numpy', 'httpx', 'cv2', 'gi', 'openai'):
+for name in ('reachy_mini', 'numpy', 'httpx', 'cv2', 'gi', 'openai', 'mcp'):
     assert name not in sys.modules, name
 """
     subprocess.run([sys.executable, "-c", script], check=True, cwd=Path(__file__).parents[3])
