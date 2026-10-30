@@ -502,6 +502,17 @@ def check_live(
     return detail
 
 
+def check_gstreamer() -> str:
+    """Warm the plugin cache before pausing the always-on app."""
+    from ambient_reachy.mic_check import GStreamerWarmupError, warm_gstreamer
+
+    try:
+        seconds = warm_gstreamer()
+    except GStreamerWarmupError as exc:
+        raise CheckFailed(str(exc)) from exc
+    return f"plugin cache ready in {seconds:.1f} s"
+
+
 def build_checks(
     settings: KitSettings,
     event_log: EventLog,
@@ -608,29 +619,35 @@ def main(argv: Sequence[str] | None = None) -> int:
     event_log = EventLog(settings.events_dir)
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     started = time.monotonic()
-    checks = build_checks(
-        settings,
-        event_log,
-        run_id,
-        mic_seconds=args.mic_seconds,
-        wake_timeout_s=args.wake_timeout,
-        speak=not args.no_speak,
-        live=args.live,
-        live_timeout_s=args.live_timeout,
-        hub_env=args.hub_env,
-        hub_log=args.hub_log,
-    )
-    pause = PausedApp(enabled=not args.no_pause)
-    try:
-        with pause:
-            if pause.paused:
-                print(f"paused {APP_LABEL}; it will be restarted when the test ends")
-            results = run_checks(checks)
-    except RuntimeError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
+    preflight = run_checks([Check("gstreamer", check_gstreamer)])
+    pause: PausedApp | None = None
+    if preflight[0].ok:
+        checks = build_checks(
+            settings,
+            event_log,
+            run_id,
+            mic_seconds=args.mic_seconds,
+            wake_timeout_s=args.wake_timeout,
+            speak=not args.no_speak,
+            live=args.live,
+            live_timeout_s=args.live_timeout,
+            hub_env=args.hub_env,
+            hub_log=args.hub_log,
+        )
+        pause = PausedApp(enabled=not args.no_pause)
+        try:
+            with pause:
+                if pause.paused:
+                    print(f"paused {APP_LABEL}; it will be restarted when the test ends")
+                results = preflight + run_checks(checks)
+        except RuntimeError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+    else:
+        results = preflight
     total_s = time.monotonic() - started
-    passed = all(result.ok for result in results) and pause.restored is not False
+    pause_restored = pause.restored if pause is not None else None
+    passed = all(result.ok for result in results) and pause_restored is not False
     for result in results:
         event_log.emit(
             "hw_test.check",
@@ -646,13 +663,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(format_table(results))
     print(f"\n{'PASS' if passed else 'FAIL'} in {total_s:.0f} s")
     if args.markdown is not None:
-        args.markdown.write_text(format_markdown(results, total_s=total_s, app_restored=pause.restored))
+        args.markdown.write_text(format_markdown(results, total_s=total_s, app_restored=pause_restored))
     if args.json is not None:
         payload = {
             "ok": passed,
             "run_id": run_id,
             "seconds": round(total_s, 1),
-            "app_restored": pause.restored,
+            "app_restored": pause_restored,
             "checks": [asdict(result) for result in results],
         }
         args.json.write_text(json.dumps(payload, indent=2) + "\n")

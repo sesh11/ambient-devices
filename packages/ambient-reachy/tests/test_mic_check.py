@@ -1,6 +1,8 @@
 """Microphone diagnostic tests."""
 
+import sys
 import threading
+import subprocess
 
 import numpy as np
 import pytest
@@ -35,6 +37,49 @@ def test_verdict() -> None:
 
 def _probe(frames: int, peak: float) -> MicProbe:
     return MicProbe(frames=frames, samples=frames * 160, rms=peak / 2, peak=peak, verdict=verdict(0.0, peak))
+
+
+def test_warm_gstreamer_returns_elapsed_time_and_runs_current_python(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[list[str], dict[str, object]]] = []
+    monotonic = iter([10.0, 12.5])
+
+    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, b"", b"")
+
+    monkeypatch.setattr(mic_check.time, "monotonic", lambda: next(monotonic))
+
+    elapsed = mic_check.warm_gstreamer(timeout_s=30.0, run=run)
+
+    assert elapsed == 2.5
+    command, kwargs = calls[0]
+    assert command[:2] == [sys.executable, "-c"]
+    assert "Gst.init([])" in command[2]
+    assert "ElementFactory.find('appsink')" in command[2]
+    assert kwargs == {
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "timeout": 30.0,
+        "check": False,
+    }
+
+
+def test_warm_gstreamer_raises_on_timeout() -> None:
+    def timeout(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        del kwargs
+        raise subprocess.TimeoutExpired(command, 15.0)
+
+    with pytest.raises(mic_check.GStreamerWarmupError, match="not ready within 15 s"):
+        mic_check.warm_gstreamer(timeout_s=15.0, run=timeout)
+
+
+def test_warm_gstreamer_raises_on_nonzero_exit() -> None:
+    def failed(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        del kwargs
+        return subprocess.CompletedProcess(command, 3, b"", b"")
+
+    with pytest.raises(mic_check.GStreamerWarmupError, match="exited with code 3"):
+        mic_check.warm_gstreamer(run=failed)
 
 
 def test_probe_microphone_bounded_returns_probe(monkeypatch: pytest.MonkeyPatch) -> None:

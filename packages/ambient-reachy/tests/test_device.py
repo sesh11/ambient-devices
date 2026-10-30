@@ -173,10 +173,12 @@ class FakeMovementManager:
 
 
 class FakeHardware:
-    def __init__(self, robots: Iterable[FakeRobot]) -> None:
+    def __init__(self, robots: Iterable[FakeRobot], *, warmup_error: Exception | None = None) -> None:
         self.robots = deque(robots)
         self.calls: list[str] = []
         self.mic_checks: list[float] = []
+        self.warmups = 0
+        self.warmup_error = warmup_error
 
     def make_robot(self) -> FakeRobot:
         return self.robots.popleft()
@@ -189,6 +191,12 @@ class FakeHardware:
         del emit
         self.mic_checks.append(seconds)
         return "ok"
+
+    def warm_gstreamer(self) -> float:
+        self.warmups += 1
+        if self.warmup_error is not None:
+            raise self.warmup_error
+        return 0.26
 
 
 def _robot(frames: Iterable[tuple[int, np.ndarray]] = (), *, fail_play_start: bool = False) -> FakeRobot:
@@ -306,6 +314,59 @@ async def test_failed_startup_releases_robot_and_allows_retry(monkeypatch: pytes
     assert await device.health()
     await device.stop()
     assert retry.closed
+
+
+async def test_gstreamer_ready_event_precedes_microphone_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_daemon(monkeypatch)
+    events: list[tuple[str, str, str, dict[str, object]]] = []
+
+    def emit(name: str, component: str, level: str = "info", **data: object) -> None:
+        events.append((name, component, level, data))
+
+    class MicCheckingHardware(FakeHardware):
+        def check_microphone(self, seconds: float, emit: Any) -> str:
+            emit("mic.check", "mic_check", verdict="ok")
+            return super().check_microphone(seconds, emit)
+
+    hardware = MicCheckingHardware([_robot()])
+    device = ReachyDevice(
+        DeviceContext("reachy-test", {"mic_autorecover": True}, emit=emit),
+        hardware=hardware,
+    )
+
+    await device.start()
+
+    assert events == [
+        ("media.gstreamer_ready", "device", "info", {"seconds": 0.3}),
+        ("mic.check", "mic_check", "info", {"verdict": "ok"}),
+    ]
+    assert hardware.mic_checks
+    assert hardware.warmups == 1
+    await device.stop()
+
+
+async def test_gstreamer_warmup_failure_warns_and_start_continues(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_daemon(monkeypatch)
+    events: list[tuple[str, str, str, dict[str, object]]] = []
+
+    def emit(name: str, component: str, level: str = "info", **data: object) -> None:
+        events.append((name, component, level, data))
+
+    robot = _robot()
+    hardware = FakeHardware([robot], warmup_error=RuntimeError("registry unavailable"))
+    device = ReachyDevice(
+        DeviceContext("reachy-test", {"mic_autorecover": False}, emit=emit),
+        hardware=hardware,
+    )
+
+    await device.start()
+
+    assert device._started
+    assert events == [
+        ("media.gstreamer_warmup_failed", "device", "warning", {"exc_type": "RuntimeError"}),
+    ]
+    assert hardware.warmups == 1
+    await device.stop()
 
 
 async def test_audio_worker_emits_single_silence_alarm_and_recovers_health(
@@ -427,7 +488,10 @@ async def test_audio_worker_failures_end_mic_report_health_and_reset_on_restart(
     health = await device.health()
     assert health.status is HealthStatus.DOWN
     assert health.reason == "mic_failed"
-    assert events == [("mic.stream_failed", "live", "error", {"exc_type": "ConnectionError"})]
+    assert events == [
+        ("media.gstreamer_ready", "device", "info", {"seconds": 0.3}),
+        ("mic.stream_failed", "live", "error", {"exc_type": "ConnectionError"}),
+    ]
     assert "private microphone detail" not in repr(events)
 
     await device.stop()
@@ -462,7 +526,10 @@ async def test_playback_worker_failure_ends_mic_rejects_play_and_resets_on_resta
     health = await device.health()
     assert health.status is HealthStatus.DOWN
     assert health.reason == "playback_failed"
-    assert events == [("speaker.playback_failed", "live", "error", {"exc_type": "RuntimeError"})]
+    assert events == [
+        ("media.gstreamer_ready", "device", "info", {"seconds": 0.3}),
+        ("speaker.playback_failed", "live", "error", {"exc_type": "RuntimeError"}),
+    ]
     assert "private playback detail" not in repr(events)
     assert device._play_queue.empty()
     with pytest.raises(RuntimeError, match="playback_failed"):
@@ -483,7 +550,7 @@ async def test_normal_stop_does_not_record_an_audio_fault(monkeypatch: pytest.Mo
     await device.stop()
 
     assert device._audio_fault is None
-    assert events == []
+    assert events == ["media.gstreamer_ready"]
 
 
 async def test_stop_playback_clears_inflight_audio_before_new_audio(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -566,7 +633,10 @@ async def test_wake_failure_emits_legacy_robot_event(monkeypatch: pytest.MonkeyP
     await device.on_session(SessionState.wake("mine"))
     await device.on_session(SessionState.sleep("other", "ignored"))
 
-    assert events == [("robot.wake_failed", "live", "error", {"exc_type": "RuntimeError"})]
+    assert events == [
+        ("media.gstreamer_ready", "device", "info", {"seconds": 0.3}),
+        ("robot.wake_failed", "live", "error", {"exc_type": "RuntimeError"}),
+    ]
     await device.stop()
 
 
@@ -698,7 +768,7 @@ async def test_unavailable_daemon_raises_and_can_be_retried(monkeypatch: pytest.
         await device.start()
     assert not device._started
     assert device._robot is None
-    assert [name for name, _, _ in events] == ["daemon.not_ready"]
+    assert [name for name, _, _ in events] == ["media.gstreamer_ready", "daemon.not_ready"]
 
     await device.start()
     await device.stop()

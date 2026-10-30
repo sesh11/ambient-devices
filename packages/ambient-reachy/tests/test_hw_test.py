@@ -149,6 +149,7 @@ def test_format_markdown_reports_failure_and_restart() -> None:
 
 def test_main_writes_reports_and_returns_exit_code(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AMBIENT_EVENTS_DIR", str(tmp_path / "events"))
+    monkeypatch.setattr(hw_test, "check_gstreamer", lambda: "plugin cache ready in 0.1 s")
     monkeypatch.setattr(
         hw_test,
         "build_checks",
@@ -160,11 +161,80 @@ def test_main_writes_reports_and_returns_exit_code(tmp_path: Path, monkeypatch: 
     assert code == 1
     payload = json.loads((tmp_path / "r.json").read_text())
     assert payload["ok"] is False
-    assert [c["status"] for c in payload["checks"]] == [PASS, FAIL]
+    assert [c["status"] for c in payload["checks"]] == [PASS, PASS, FAIL]
     assert "FAIL" in (tmp_path / "r.md").read_text()
     events = EventLog(tmp_path / "events").read(datetime(2000, 1, 1, tzinfo=timezone.utc))
-    assert [e.type for e in events] == ["hw_test.check", "hw_test.check", "hw_test.completed"]
+    assert [e.type for e in events] == [
+        "hw_test.check",
+        "hw_test.check",
+        "hw_test.check",
+        "hw_test.completed",
+    ]
     assert events[-1].data["ok"] is False
+
+
+def test_check_gstreamer_reports_ready_time_and_converts_warmup_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ambient_reachy import mic_check
+
+    monkeypatch.setattr(mic_check, "warm_gstreamer", lambda: 1.25)
+    assert hw_test.check_gstreamer() == "plugin cache ready in 1.2 s"
+
+    def fail_warmup() -> float:
+        raise mic_check.GStreamerWarmupError("GStreamer plugin cache not ready within 180 s")
+
+    monkeypatch.setattr(mic_check, "warm_gstreamer", fail_warmup)
+    with pytest.raises(CheckFailed, match="not ready within 180 s"):
+        hw_test.check_gstreamer()
+
+
+def test_main_skips_pause_and_other_checks_when_gstreamer_preflight_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("AMBIENT_EVENTS_DIR", str(tmp_path / "events"))
+    monkeypatch.setattr(hw_test, "check_gstreamer", lambda: _fail())
+    monkeypatch.setattr(hw_test, "build_checks", lambda *args, **kwargs: pytest.fail("other checks were built"))
+    monkeypatch.setattr(hw_test, "PausedApp", lambda **kwargs: pytest.fail("app pause was created"))
+
+    code = hw_test.main(["--json", str(tmp_path / "result.json"), "--markdown", str(tmp_path / "result.md")])
+
+    output = capsys.readouterr().out
+    assert code == 1
+    assert "gstreamer" in output
+    assert "FAIL" in output
+    payload = json.loads((tmp_path / "result.json").read_text())
+    assert [check["name"] for check in payload["checks"]] == ["gstreamer"]
+    assert payload["app_restored"] is None
+    assert "| gstreamer | FAIL | broken |" in (tmp_path / "result.md").read_text()
+
+
+def test_main_lists_gstreamer_before_other_checks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("AMBIENT_EVENTS_DIR", str(tmp_path / "events"))
+    sequence: list[str] = []
+
+    def check_gstreamer() -> str:
+        sequence.append("gstreamer")
+        return "plugin cache ready in 0.1 s"
+
+    def build_checks(*args: object, **kwargs: object) -> list[Check]:
+        del args, kwargs
+        sequence.append("build_checks")
+        return [Check("other", lambda: sequence.append("other") or "done")]
+
+    monkeypatch.setattr(hw_test, "check_gstreamer", check_gstreamer)
+    monkeypatch.setattr(hw_test, "build_checks", build_checks)
+
+    assert hw_test.main(["--no-pause"]) == 0
+
+    output = capsys.readouterr().out
+    result_lines = [line for line in output.splitlines() if line.startswith(("gstreamer", "other"))]
+    assert sequence == ["gstreamer", "build_checks", "other"]
+    assert [line.split()[0] for line in result_lines] == ["gstreamer", "other"]
 
 
 def test_wake_check_skips_without_hub_command(tmp_path: Path) -> None:
@@ -689,6 +759,7 @@ def test_build_checks_passes_hub_env_and_log_to_wake_check(tmp_path: Path, monke
 def test_main_parses_repeatable_hub_env_values(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AMBIENT_EVENTS_DIR", str(tmp_path / "events"))
     captured: dict[str, object] = {}
+    monkeypatch.setattr(hw_test, "check_gstreamer", lambda: "plugin cache ready in 0.1 s")
 
     def build_checks(*args, **kwargs):
         del args

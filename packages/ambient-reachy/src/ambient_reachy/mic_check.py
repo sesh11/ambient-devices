@@ -1,11 +1,13 @@
 """Reachy Mini microphone diagnostic and XMOS recovery tool."""
 
+import sys
 import time
 import logging
 import argparse
 import threading
+import subprocess
 from dataclasses import dataclass
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
@@ -16,10 +18,19 @@ logger = logging.getLogger(__name__)
 
 XMOS_RESTART_SETTLE_S = 5.0
 MIC_PROBE_STARTUP_S = 10.0
+GST_WARMUP_TIMEOUT_S = 180.0
+_GST_WARMUP_CODE = (
+    "import gi; gi.require_version('Gst', '1.0'); from gi.repository import Gst; "
+    "Gst.init([]); raise SystemExit(0 if Gst.ElementFactory.find('appsink') else 3)"
+)
 
 
 class MicProbeTimeout(TimeoutError):
     """Raised when microphone audio does not arrive within the probe deadline."""
+
+
+class GStreamerWarmupError(RuntimeError):
+    """Raised when the GStreamer plugin cache cannot be prepared in time."""
 
 
 @dataclass(frozen=True)
@@ -141,6 +152,32 @@ def probe_microphone(seconds: float) -> MicProbe:
         peak=peak,
         verdict=verdict(rms, peak),
     )
+
+
+def warm_gstreamer(
+    timeout_s: float = GST_WARMUP_TIMEOUT_S,
+    run: Callable[..., subprocess.CompletedProcess[bytes]] = subprocess.run,
+) -> float:
+    """Initialize the GStreamer plugin registry in a bounded subprocess."""
+    logger.info("Warming GStreamer plugin cache")
+    started = time.monotonic()
+    try:
+        completed = run(
+            [sys.executable, "-c", _GST_WARMUP_CODE],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout_s,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        elapsed = time.monotonic() - started
+        logger.info("GStreamer plugin cache warm-up took %.1f s", elapsed)
+        raise GStreamerWarmupError(f"GStreamer plugin cache not ready within {timeout_s:.0f} s") from exc
+    elapsed = time.monotonic() - started
+    logger.info("GStreamer plugin cache warm-up took %.1f s", elapsed)
+    if completed.returncode != 0:
+        raise GStreamerWarmupError(f"GStreamer warm-up exited with code {completed.returncode}")
+    return elapsed
 
 
 def probe_microphone_bounded(seconds: float, timeout_s: float | None = None) -> MicProbe:

@@ -43,6 +43,9 @@ class HardwareFactory(Protocol):
     def check_microphone(self, seconds: float, emit: EventSink) -> str:
         """Check audio input and optionally recover the XMOS processor."""
 
+    def warm_gstreamer(self) -> float:
+        """Prepare the GStreamer plugin cache before using media pipelines."""
+
 
 class _DefaultHardware:
     def make_robot(self) -> Any:
@@ -59,6 +62,11 @@ class _DefaultHardware:
         from ambient_reachy.mic_check import ensure_microphone_audio
 
         return ensure_microphone_audio(seconds, emit)
+
+    def warm_gstreamer(self) -> float:
+        from ambient_reachy.mic_check import warm_gstreamer
+
+        return warm_gstreamer()
 
 
 class ReachyDevice:
@@ -130,6 +138,17 @@ class ReachyDevice:
         try:
             from ambient_reachy.daemon import wait_for_daemon
 
+            try:
+                seconds = await asyncio.to_thread(self._hardware.warm_gstreamer)
+                self.context.emit("media.gstreamer_ready", "device", seconds=round(seconds, 1))
+            except Exception as exc:
+                logger.warning("GStreamer plugin cache warm-up failed; continuing: %s", exc)
+                self.context.emit(
+                    "media.gstreamer_warmup_failed",
+                    "device",
+                    "warning",
+                    exc_type=type(exc).__name__,
+                )
             if self.config.mic_autorecover:
                 try:
                     result = await asyncio.to_thread(
