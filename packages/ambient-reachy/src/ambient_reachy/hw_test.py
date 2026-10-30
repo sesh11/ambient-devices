@@ -293,6 +293,7 @@ def _check_hub_wake(
     speak: bool,
     popen: Callable[..., subprocess.Popen[bytes]],
     hub_env: Sequence[tuple[str, str]] = (),
+    startup_timeout_s: float = 45.0,
 ) -> str:
     """Run the configured hub, speak the wake phrase, and require its wake event."""
     if not settings.hub_command:
@@ -315,7 +316,7 @@ def _check_hub_wake(
     phrase = wake_phrase(settings.wake_word)
     speaker: subprocess.Popen[bytes] | None = None
     try:
-        deadline = time.monotonic() + timeout_s
+        deadline = time.monotonic() + startup_timeout_s
         app_started = None
         while app_started is None:
             app_started = next((event for event in event_log.read(started_at) if event.type == "app.started"), None)
@@ -325,6 +326,13 @@ def _check_hub_wake(
                 raise CheckFailed("hub did not emit app.started in time")
             if app_started is None:
                 time.sleep(0.25)
+        while not any(event.type == "wake.ready" for event in event_log.read(app_started.ts)):
+            if process.poll() is not None:
+                raise CheckFailed(f"hub exited with code {process.returncode} before wake.ready")
+            if time.monotonic() > deadline:
+                raise CheckFailed("hub did not emit wake.ready in time; check its device and wake model")
+            time.sleep(0.25)
+        deadline = time.monotonic() + timeout_s
         say = shutil.which("say") if speak else None
         if speak and say is None:
             raise CheckFailed("macOS `say` not found; rerun with --no-speak and say the wake word yourself")
@@ -379,9 +387,10 @@ def check_wake_word(
     popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
     *,
     hub_env: Sequence[tuple[str, str]] = (),
+    startup_timeout_s: float = 45.0,
 ) -> str:
     """Exercise the hub's own wake-word detector when a hub command is configured."""
-    return _check_hub_wake(settings, event_log, timeout_s, speak, popen, hub_env)
+    return _check_hub_wake(settings, event_log, timeout_s, speak, popen, hub_env, startup_timeout_s)
 
 
 def check_live(

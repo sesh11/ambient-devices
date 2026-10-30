@@ -346,6 +346,8 @@ def test_hub_wake_blanks_provider_keys_and_preserves_unrelated_environment(
             if self.polls == 1:
                 event_log.emit("app.started", "app")
             elif self.polls == 2:
+                event_log.emit("wake.ready", "gateway", device="reachy")
+            elif self.polls == 3:
                 event_log.emit("wake.detected", "live")
             return None
 
@@ -393,6 +395,115 @@ def test_hub_wake_blanks_provider_keys_and_preserves_unrelated_environment(
     assert process.env["AMBIENT_DEVICES_FILE"] == "/existing/devices.toml"
     assert process.env["REACHY_TEST_ENV"] == "free=value"
     assert process.terminated
+
+
+@pytest.mark.parametrize("ready_after", [0.0, 10.0, 25.0])
+def test_wake_speaks_only_after_detector_ready_with_a_fresh_detection_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ready_after: float
+) -> None:
+    from ambient_reachy.settings import KitSettings
+
+    log = EventLog(tmp_path)
+    clock = [0.0]
+    spoken_at: list[float] = []
+    monkeypatch.setattr(hw_test.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(hw_test.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    monkeypatch.setattr(hw_test.shutil, "which", lambda name: "/usr/bin/say")
+
+    class Process:
+        returncode = None
+        started = False
+        ready = False
+        terminated = False
+
+        def poll(self):
+            if not self.started:
+                log.emit("app.started", "app")
+                self.started = True
+            if not self.ready and clock[0] >= ready_after:
+                log.emit("wake.ready", "gateway", device="reachy")
+                self.ready = True
+            if spoken_at and clock[0] >= spoken_at[0] + 0.75:
+                log.emit("wake.detected", "live")
+            return None
+
+        def terminate(self):
+            self.terminated = True
+
+        def wait(self, timeout):
+            return 0
+
+    process = Process()
+
+    def popen(command, **kwargs):
+        if command[0] == "/usr/bin/say":
+            assert process.ready
+            spoken_at.append(clock[0])
+            return type("Speaker", (), {"poll": lambda self: 0})()
+        return process
+
+    detail = hw_test.check_wake_word(
+        KitSettings(events_dir=tmp_path, hub_command="fake-hub"),
+        log,
+        1.0,
+        True,
+        popen=popen,
+        startup_timeout_s=30.0,
+    )
+    assert "wake detected by hub" in detail
+    assert len(spoken_at) == 1
+    assert spoken_at[0] >= ready_after
+    assert process.terminated
+
+
+@pytest.mark.parametrize(
+    ("state", "message"),
+    [
+        ("not-ready", "did not emit wake.ready"),
+        ("exited", "exited with code 7 before wake.ready"),
+        ("no-wake", "did not emit wake.detected"),
+    ],
+)
+def test_wake_readiness_and_detection_failures_remain_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str, message: str
+) -> None:
+    from ambient_reachy.settings import KitSettings
+
+    log = EventLog(tmp_path)
+    log.emit("wake.ready", "gateway", device="stale-previous-run")
+    clock = [0.0]
+    monkeypatch.setattr(hw_test.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(hw_test.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+
+    class Process:
+        returncode = None
+        started = False
+
+        def poll(self):
+            if not self.started:
+                log.emit("app.started", "app")
+                if state == "no-wake":
+                    log.emit("wake.ready", "gateway", device="reachy")
+                self.started = True
+            if state == "exited" and clock[0] > 0.5:
+                self.returncode = 7
+            return self.returncode
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout):
+            return 0
+
+    with pytest.raises(CheckFailed, match=message):
+        hw_test.check_wake_word(
+            KitSettings(events_dir=tmp_path, hub_command="fake-hub"),
+            log,
+            1.0,
+            False,
+            popen=lambda *args, **kwargs: Process(),
+            startup_timeout_s=1.0,
+        )
 
 
 @pytest.mark.parametrize("key", ["OPENAI_API_KEY", "DEVIN_API_KEY", "DEVIN_ORG_ID", "AMBIENT_GARAGE_URL"])
