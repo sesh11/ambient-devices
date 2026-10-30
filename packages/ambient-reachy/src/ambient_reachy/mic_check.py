@@ -3,6 +3,7 @@
 import time
 import logging
 import argparse
+import threading
 from dataclasses import dataclass
 from collections.abc import Sequence
 
@@ -14,6 +15,11 @@ from ambient_device_sdk import EventSink, null_event_sink
 logger = logging.getLogger(__name__)
 
 XMOS_RESTART_SETTLE_S = 5.0
+MIC_PROBE_STARTUP_S = 10.0
+
+
+class MicProbeTimeout(TimeoutError):
+    """Raised when microphone audio does not arrive within the probe deadline."""
 
 
 @dataclass(frozen=True)
@@ -137,14 +143,69 @@ def probe_microphone(seconds: float) -> MicProbe:
     )
 
 
-def ensure_microphone_audio(seconds: float = 1.5, emit: EventSink = null_event_sink) -> str:
+def probe_microphone_bounded(seconds: float, timeout_s: float | None = None) -> MicProbe:
+    """Run a microphone probe in a daemon thread and bound how long it can block."""
+    timeout = seconds + MIC_PROBE_STARTUP_S if timeout_s is None else timeout_s
+    result: list[MicProbe] = []
+    errors: list[BaseException] = []
+
+    def probe() -> None:
+        try:
+            result.append(probe_microphone(seconds))
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=probe, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        raise MicProbeTimeout(f"microphone gave no result within {timeout:.0f} s")
+    if errors:
+        raise errors[0]
+    return result[0]
+
+
+def ensure_microphone_audio(
+    seconds: float = 1.5,
+    emit: EventSink = null_event_sink,
+    timeout_s: float | None = None,
+) -> str:
     """Probe the microphone and restart the audio processor when it is silent.
 
     Reachy Mini Lite streams all-zero microphone audio after some USB
     connections until the XMOS processor is rebooted, so recover once before
     the wake-word loop starts. Returns the final verdict.
     """
-    probe = probe_microphone(seconds)
+    logger.info("Probing microphone for %.1f s", seconds)
+    try:
+        probe = probe_microphone_bounded(seconds, timeout_s)
+    except MicProbeTimeout:
+        logger.warning("Microphone gave no result during the initial probe; restarting the audio processor.")
+        emit("mic.check", "mic_check", "warning", verdict="timeout", frames=0, peak=0.0, stage="initial")
+        if not restart_audio_processor(emit=emit):
+            return "timeout"
+        try:
+            recheck = probe_microphone_bounded(seconds, timeout_s)
+        except MicProbeTimeout:
+            logger.error("Microphone gave no result after restarting the audio processor.")
+            emit("mic.check", "mic_check", "error", verdict="timeout", frames=0, peak=0.0, stage="after_restart")
+            return "timeout"
+        emit(
+            "mic.check",
+            "mic_check",
+            verdict=recheck.verdict,
+            frames=recheck.frames,
+            peak=recheck.peak,
+            stage="after_restart",
+        )
+        if recheck.verdict == "silent":
+            logger.error(
+                "Microphone still silent after restarting the audio processor. "
+                "Check the microphone FPC cable (Pollen troubleshooting guide)."
+            )
+        else:
+            logger.info("Microphone recovered after audio processor restart: peak=%.6f", recheck.peak)
+        return recheck.verdict
     emit(
         "mic.check",
         "mic_check",
@@ -163,7 +224,12 @@ def ensure_microphone_audio(seconds: float = 1.5, emit: EventSink = null_event_s
     logger.warning("Microphone returned only zeros (%d frames); restarting the audio processor.", probe.frames)
     if not restart_audio_processor(emit=emit):
         return probe.verdict
-    recheck = probe_microphone(seconds)
+    try:
+        recheck = probe_microphone_bounded(seconds, timeout_s)
+    except MicProbeTimeout:
+        logger.error("Microphone gave no result after restarting the audio processor.")
+        emit("mic.check", "mic_check", "error", verdict="timeout", frames=0, peak=0.0, stage="after_restart")
+        return "timeout"
     emit(
         "mic.check",
         "mic_check",

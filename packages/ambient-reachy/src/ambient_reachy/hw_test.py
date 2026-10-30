@@ -11,6 +11,7 @@ import argparse
 import platform
 import subprocess
 from types import TracebackType
+from typing import BinaryIO
 from pathlib import Path
 from datetime import datetime, timezone
 from dataclasses import asdict, replace, dataclass
@@ -113,12 +114,14 @@ class PausedApp:
         self,
         *,
         enabled: bool = True,
+        settle_s: float = 5.0,
         plist: Path | None = None,
         run: Callable[..., subprocess.CompletedProcess[str]] = launchctl,
         system: Callable[[], str] = platform.system,
     ) -> None:
         """Configure which agent to pause."""
         self.enabled = enabled
+        self.settle_s = settle_s
         self.plist = plist or Path("~/Library/LaunchAgents").expanduser() / f"{APP_LABEL}.plist"
         self._run = run
         self._system = system
@@ -136,7 +139,7 @@ class PausedApp:
         if result.returncode != 0:
             raise RuntimeError(f"could not stop {APP_LABEL}: {result.stderr.strip() or result.stdout.strip()}")
         self.paused = True
-        time.sleep(1.0)
+        time.sleep(self.settle_s)
         return self
 
     def __exit__(
@@ -214,14 +217,38 @@ def check_audio_device() -> str:
 
 def check_microphone(seconds: float) -> str:
     """Pass when a short recording has real sound, rebooting the XMOS chip once if it is all zeros like the app does."""
-    from ambient_reachy.mic_check import probe_microphone, restart_audio_processor
+    from ambient_reachy.mic_check import (
+        MIC_PROBE_STARTUP_S,
+        MicProbeTimeout,
+        restart_audio_processor,
+        probe_microphone_bounded,
+    )
 
-    probe = probe_microphone(seconds)
+    timeout = seconds + MIC_PROBE_STARTUP_S
+    first_timed_out = False
+    try:
+        probe = probe_microphone_bounded(seconds)
+    except MicProbeTimeout as exc:
+        first_timed_out = True
+        if not restart_audio_processor():
+            raise CheckFailed(f"no audio within {timeout:.0f} s; audio board not found for reboot") from exc
+        try:
+            probe = probe_microphone_bounded(seconds)
+        except MicProbeTimeout as retry_exc:
+            raise CheckFailed(str(retry_exc)) from retry_exc
     detail = f"verdict={probe.verdict} frames={probe.frames} peak={probe.peak:.4f}"
-    if probe.verdict == "silent" and probe.frames > 0:
+    if first_timed_out:
+        detail = (
+            f"no audio within {timeout:.0f} s until XMOS reboot, then "
+            f"verdict={probe.verdict} frames={probe.frames} peak={probe.peak:.4f}"
+        )
+    elif probe.verdict == "silent" and probe.frames > 0:
         if not restart_audio_processor():
             raise CheckFailed(f"{detail}; audio board not found for reboot")
-        probe = probe_microphone(seconds)
+        try:
+            probe = probe_microphone_bounded(seconds)
+        except MicProbeTimeout as exc:
+            raise CheckFailed(str(exc)) from exc
         detail = f"silent until XMOS reboot, then verdict={probe.verdict} frames={probe.frames} peak={probe.peak:.4f}"
     if probe.verdict != "ok":
         raise CheckFailed(f"{detail}; check the microphone cable")
@@ -230,7 +257,7 @@ def check_microphone(seconds: float) -> str:
 
 def check_speech_heard(seconds: float, wake_word: str, speak: bool) -> str:
     """Pass when a short device-only recording contains non-silent sound."""
-    from ambient_reachy.mic_check import probe_microphone
+    from ambient_reachy.mic_check import MicProbeTimeout, probe_microphone_bounded
 
     phrase = wake_phrase(wake_word)
     speaker: subprocess.Popen[bytes] | None = None
@@ -242,7 +269,10 @@ def check_speech_heard(seconds: float, wake_word: str, speak: bool) -> str:
     else:
         print(f"say '{phrase}' now")
     try:
-        probe = probe_microphone(seconds)
+        try:
+            probe = probe_microphone_bounded(seconds)
+        except MicProbeTimeout as exc:
+            raise CheckFailed(str(exc)) from exc
     finally:
         if speaker is not None and speaker.poll() is None:
             speaker.terminate()
@@ -294,6 +324,7 @@ def _check_hub_wake(
     popen: Callable[..., subprocess.Popen[bytes]],
     hub_env: Sequence[tuple[str, str]] = (),
     startup_timeout_s: float = 45.0,
+    hub_log: Path | None = None,
 ) -> str:
     """Run the configured hub, speak the wake phrase, and require its wake event."""
     if not settings.hub_command:
@@ -312,10 +343,20 @@ def _check_hub_wake(
         "AMBIENT_GARAGE_URL": "",
     }
     env.update(hub_env)
-    process = popen(shlex.split(settings.hub_command), env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    hub_log_file: BinaryIO | None = None
+    if hub_log is not None:
+        hub_log.parent.mkdir(parents=True, exist_ok=True)
+        hub_log_file = hub_log.open("wb")
+        stdout: int | BinaryIO = hub_log_file
+        stderr: int = subprocess.STDOUT
+    else:
+        stdout = subprocess.DEVNULL
+        stderr = subprocess.DEVNULL
+    process: subprocess.Popen[bytes] | None = None
     phrase = wake_phrase(settings.wake_word)
     speaker: subprocess.Popen[bytes] | None = None
     try:
+        process = popen(shlex.split(settings.hub_command), env=env, stdout=stdout, stderr=stderr)
         deadline = time.monotonic() + startup_timeout_s
         app_started = None
         while app_started is None:
@@ -362,12 +403,15 @@ def _check_hub_wake(
     finally:
         if speaker is not None and speaker.poll() is None:
             speaker.terminate()
-        if process.poll() is None:
+        if process is not None and process.poll() is None:
             process.terminate()
             try:
                 process.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 process.kill()
+        if hub_log is not None and hub_log_file is not None:
+            hub_log_file.close()
+            hub_log.write_text(scrub_text(hub_log.read_text(errors="replace")))
     assert app_started is not None
     dispatched = [
         event
@@ -388,9 +432,10 @@ def check_wake_word(
     *,
     hub_env: Sequence[tuple[str, str]] = (),
     startup_timeout_s: float = 45.0,
+    hub_log: Path | None = None,
 ) -> str:
     """Exercise the hub's own wake-word detector when a hub command is configured."""
-    return _check_hub_wake(settings, event_log, timeout_s, speak, popen, hub_env, startup_timeout_s)
+    return _check_hub_wake(settings, event_log, timeout_s, speak, popen, hub_env, startup_timeout_s, hub_log)
 
 
 def check_live(
@@ -468,6 +513,7 @@ def build_checks(
     live: bool,
     live_timeout_s: float,
     hub_env: Sequence[tuple[str, str]] = (),
+    hub_log: Path | None = None,
 ) -> list[Check]:
     """Return the hardware checks in the order they run."""
     checks = [
@@ -482,7 +528,7 @@ def build_checks(
         ),
         Check(
             "wake word",
-            lambda: check_wake_word(settings, event_log, wake_timeout_s, speak, hub_env=hub_env),
+            lambda: check_wake_word(settings, event_log, wake_timeout_s, speak, hub_env=hub_env, hub_log=hub_log),
             needs=("daemon", "microphone"),
         ),
         Check("head", check_head, needs=("daemon",)),
@@ -535,6 +581,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--live-timeout", type=float, default=60.0)
     parser.add_argument("--hub-command", default=None, help="command to start ambient-home for wake checks")
     parser.add_argument(
+        "--hub-log", type=Path, default=None, help="save the hub's scrubbed output from the wake check here"
+    )
+    parser.add_argument(
         "--hub-env",
         action="append",
         type=_parse_hub_env,
@@ -569,6 +618,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         live=args.live,
         live_timeout_s=args.live_timeout,
         hub_env=args.hub_env,
+        hub_log=args.hub_log,
     )
     pause = PausedApp(enabled=not args.no_pause)
     try:

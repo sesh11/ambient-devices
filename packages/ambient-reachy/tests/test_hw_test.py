@@ -101,6 +101,18 @@ def test_paused_app_restarts_even_when_checks_raise(monkeypatch: pytest.MonkeyPa
     assert pause.restored is True
 
 
+def test_paused_app_uses_default_and_custom_settle_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr(hw_test.time, "sleep", sleeps.append)
+
+    with PausedApp(run=FakeLaunchctl(loaded=True), system=lambda: "Darwin"):
+        pass
+    with PausedApp(settle_s=2.5, run=FakeLaunchctl(loaded=True), system=lambda: "Darwin"):
+        pass
+
+    assert sleeps == [5.0, 2.5]
+
+
 def test_paused_app_leaves_unloaded_agent_alone() -> None:
     fake = FakeLaunchctl(loaded=False)
 
@@ -328,6 +340,58 @@ def test_speech_heard_prompts_or_uses_say(monkeypatch: pytest.MonkeyPatch, capsy
     assert "verdict=ok" in check_speech_heard(0.1, "hey_jarvis", True)
 
 
+def test_check_microphone_timeout_reboots_and_reprobes(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ambient_reachy import mic_check
+    from ambient_reachy.mic_check import MicProbe, MicProbeTimeout
+
+    results = iter([MicProbeTimeout("microphone gave no result within 11 s"), MicProbe(100, 16000, 0.1, 0.2, "ok")])
+    restarts: list[bool] = []
+
+    def probe_bounded(seconds: float) -> MicProbe:
+        del seconds
+        result = next(results)
+        if isinstance(result, MicProbeTimeout):
+            raise result
+        return result
+
+    monkeypatch.setattr(mic_check, "restart_audio_processor", lambda: restarts.append(True) or True)
+    monkeypatch.setattr(mic_check, "probe_microphone_bounded", probe_bounded)
+
+    detail = hw_test.check_microphone(1.0)
+
+    assert detail.startswith("no audio within 11 s until XMOS reboot")
+    assert restarts == [True]
+
+
+def test_check_microphone_timeout_twice_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ambient_reachy import mic_check
+    from ambient_reachy.mic_check import MicProbeTimeout
+
+    monkeypatch.setattr(
+        mic_check,
+        "probe_microphone_bounded",
+        lambda seconds: (_ for _ in ()).throw(MicProbeTimeout("microphone gave no result within 11 s")),
+    )
+    monkeypatch.setattr(mic_check, "restart_audio_processor", lambda: True)
+
+    with pytest.raises(CheckFailed, match="microphone gave no result within 11 s"):
+        hw_test.check_microphone(1.0)
+
+
+def test_speech_heard_timeout_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ambient_reachy import mic_check
+    from ambient_reachy.mic_check import MicProbeTimeout
+
+    monkeypatch.setattr(
+        mic_check,
+        "probe_microphone_bounded",
+        lambda seconds: (_ for _ in ()).throw(MicProbeTimeout("microphone gave no result within 11 s")),
+    )
+
+    with pytest.raises(CheckFailed, match="microphone gave no result within 11 s"):
+        hw_test.check_speech_heard(1.0, "hey_jarvis", False)
+
+
 def test_hub_wake_blanks_provider_keys_and_preserves_unrelated_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -364,8 +428,9 @@ def test_hub_wake_blanks_provider_keys_and_preserves_unrelated_environment(
     process = Process()
 
     def popen(command, *, env, **kwargs):
-        del kwargs
         assert command == ["python", "-m", "ambient_home"]
+        assert kwargs["stdout"] is subprocess.DEVNULL
+        assert kwargs["stderr"] is subprocess.DEVNULL
         process.env = env
         return process
 
@@ -395,6 +460,58 @@ def test_hub_wake_blanks_provider_keys_and_preserves_unrelated_environment(
     assert process.env["AMBIENT_DEVICES_FILE"] == "/existing/devices.toml"
     assert process.env["REACHY_TEST_ENV"] == "free=value"
     assert process.terminated
+
+
+def test_hub_wake_saves_scrubbed_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from ambient_reachy.settings import KitSettings
+
+    event_log = EventLog(tmp_path / "events")
+    hub_log = tmp_path / "logs" / "hub.log"
+
+    class Process:
+        returncode = None
+        polls = 0
+
+        def poll(self) -> int | None:
+            self.polls += 1
+            if self.polls == 1:
+                event_log.emit("app.started", "app")
+            elif self.polls == 2:
+                event_log.emit("wake.ready", "gateway", device="reachy")
+            elif self.polls == 3:
+                event_log.emit("wake.detected", "live")
+            return None
+
+        def terminate(self) -> None:
+            pass
+
+        def wait(self, timeout: float) -> int:
+            del timeout
+            return 0
+
+    process = Process()
+
+    def popen(command, **kwargs):
+        if command[0] == "fake-hub":
+            assert kwargs["stderr"] is subprocess.STDOUT
+            kwargs["stdout"].write(b"hub line OPENAI_API_KEY=sk-test123456789\n")
+            return process
+        return process
+
+    monkeypatch.setattr(hw_test.shutil, "which", lambda name: None)
+    result = hw_test.check_wake_word(
+        KitSettings(events_dir=event_log.directory, hub_command="fake-hub"),
+        event_log,
+        1.0,
+        False,
+        popen=popen,
+        hub_log=hub_log,
+    )
+
+    content = hub_log.read_text()
+    assert "wake detected by hub" in result
+    assert "hub line" in content
+    assert "sk-test123456789" not in content
 
 
 @pytest.mark.parametrize("ready_after", [0.0, 10.0, 25.0])
@@ -527,20 +644,21 @@ def test_hub_env_malformed_values_exit_two(value: str, message: str, capsys: pyt
     assert message in capsys.readouterr().err
 
 
-def test_build_checks_passes_hub_env_to_both_hub_checks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_build_checks_passes_hub_env_and_log_to_wake_check(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from ambient_reachy.settings import KitSettings
 
-    received: list[tuple[str, tuple[tuple[str, str], ...]]] = []
+    received: list[tuple[str, tuple[tuple[str, str], ...], Path | None]] = []
     pairs = (("AMBIENT_DATA_DIR", "/isolated/data"), ("AMBIENT_DEVICES_FILE", "/isolated/devices.toml"))
+    hub_log = tmp_path / "hub.log"
 
-    def free_check(*args, hub_env=(), **kwargs) -> str:
+    def free_check(*args, hub_env=(), hub_log=None, **kwargs) -> str:
         del args, kwargs
-        received.append(("wake", tuple(hub_env)))
+        received.append(("wake", tuple(hub_env), hub_log))
         return "wake"
 
     def live_check(*args, hub_env=(), **kwargs) -> str:
         del args, kwargs
-        received.append(("live", tuple(hub_env)))
+        received.append(("live", tuple(hub_env), None))
         return "live"
 
     monkeypatch.setattr(hw_test, "check_daemon", lambda settings: "daemon")
@@ -560,11 +678,12 @@ def test_build_checks_passes_hub_env_to_both_hub_checks(tmp_path: Path, monkeypa
         live=True,
         live_timeout_s=1,
         hub_env=pairs,
+        hub_log=hub_log,
     )
 
     run_checks(checks)
 
-    assert received == [("wake", pairs), ("live", pairs)]
+    assert received == [("wake", pairs, hub_log), ("live", pairs, None)]
 
 
 def test_main_parses_repeatable_hub_env_values(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -579,9 +698,21 @@ def test_main_parses_repeatable_hub_env_values(tmp_path: Path, monkeypatch: pyte
     monkeypatch.setattr(hw_test, "build_checks", build_checks)
 
     assert (
-        hw_test.main(["--no-pause", "--hub-env", "CUSTOM=first=value", "--hub-env", "AMBIENT_DATA_DIR=/isolated"]) == 0
+        hw_test.main(
+            [
+                "--no-pause",
+                "--hub-log",
+                str(tmp_path / "hub.log"),
+                "--hub-env",
+                "CUSTOM=first=value",
+                "--hub-env",
+                "AMBIENT_DATA_DIR=/isolated",
+            ]
+        )
+        == 0
     )
     assert captured["hub_env"] == [("CUSTOM", "first=value"), ("AMBIENT_DATA_DIR", "/isolated")]
+    assert captured["hub_log"] == tmp_path / "hub.log"
 
 
 def test_hub_env_help_documents_per_run_isolation(capsys: pytest.CaptureFixture[str]) -> None:

@@ -10,3 +10,4 @@ The free `ambient-reachy-hw-test --hub-command "..."` wake check requires the hu
 `wake.ready` event, emitted after the detector processes microphone audio. It allows
 45 seconds for startup, then the full `--wake-timeout` window for detection. It
 does not speak at `app.started`, which does not mean the microphone is ready.
+Use `--hub-log PATH` to save the wake-check hub output after secret scrubbing.
